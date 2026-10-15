@@ -37,7 +37,7 @@ run them overnight. It also works with plans from anywhere else: they are just M
 ## Install
 
 ```sh
-mise use -g github:bendangelo/dangle@0.1.6
+mise use -g github:bendangelo/dangle@0.1.7
 # (plain `github:bendangelo/dangle` works too, once a release is a day old: mise's
 #  minimum_release_age)
 # or
@@ -81,6 +81,9 @@ Done when: `cargo test payroll_employee`
 - `depends=` holds a plan back until those plans have landed (a dependency that fails holds it
   for the night). `agent=` picks the agent for it.
 - `Done when:` is a command dangle runs after the gate; the plan lands only when it passes.
+- **Private plans:** if git ignores the plans folder (a public repository whose plans stay
+  out of it), dangle copies the plans into each worktree, never commits them, and moves a
+  landed plan to `done/` on disk.
 - Keep plans small: one goal, one session, a few hundred lines at most (`dangle lint` warns).
   The skill from `dangle skill` tells your agents all of this, and how to tidy a repository's
   existing plans into this shape.

@@ -9,7 +9,7 @@
 set -u
 LC_ALL=C
 export LC_ALL
-VERSION=0.1.6
+VERSION=0.1.7
 
 # ---------------------------------------------------------------- output
 
@@ -146,6 +146,10 @@ settings() {
   AGENT_SECS=$(to_secs "$(cfg AGENT_TIMEOUT 4h)")
   GATE_SECS=$(to_secs "$(cfg GATE_TIMEOUT 60m)")
   HB_SECS=$(to_secs "$(cfg HEARTBEAT 5m)")
+  # Private plans: a plans folder git ignores (kept out of a public repository). They are read
+  # from the main checkout, copied into each worktree, and moved to the done folder on disk.
+  PRIVATE=0
+  git -C "$PRIMARY" check-ignore -q "$PLANS/x.md" 2>/dev/null && PRIVATE=1
   REMOTE=${DANGLE_REMOTE:-$(cfg REMOTE origin)}
   if [ "$REMOTE" = none ] || ! git remote get-url "$REMOTE" >/dev/null 2>&1; then REMOTE=; fi
   TIMEOUT_BIN=
@@ -389,6 +393,9 @@ new_worktree() {
     git worktree add -q -b "$branch" "$path" "$from" || return 1
   fi
   copy_into "$path"
+  if [ "$PRIVATE" = 1 ]; then
+    mkdir -p "$path/$PLANS" && cp -R "$PRIMARY/$PLANS/." "$path/$PLANS/"
+  fi
   export_ctx "$path" "$branch"
   hook setup "$path" || { err "the setup hook failed in $path"; return 1; }
 }
@@ -438,6 +445,11 @@ plan_done_when() { sed -n 's/^[*_]*Done when:[*_]*[^`]*`\([^`]*\)`.*/\1/p' "$1" 
 # Cached per commit of the base branch: a run asks this for every plan, again and again.
 landed_ids() {
   local sha cache
+  if [ "$PRIVATE" = 1 ]; then
+    ls "$PRIMARY/$PLANS/$DONE" 2>/dev/null | sed -n 's/\.md$//p' |
+      sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}-//; s/^([0-9]+)(-.*)?$/\1/'
+    return 0
+  fi
   sha=$(git rev-parse -q --verify "refs/heads/$BASE") || return 0
   cache="$STATE/landed-$sha"
   if [ ! -f "$cache" ]; then
@@ -618,6 +630,11 @@ regate_needed() { # <old base> <new base>
 FAIL_REASON=
 fail() { FAIL_REASON=$1; return 1; }
 
+# done_on_disk <plan file>: a private plan that landed moves to the done folder.
+done_on_disk() {
+  mkdir -p "$PRIMARY/$PLANS/$DONE" && mv "$PRIMARY/$PLANS/${1##*/}" "$PRIMARY/$PLANS/$DONE/"
+}
+
 # merge_base_in <worktree> <interactive>: merges the base branch into the worktree's branch.
 merge_base_in() {
   git -C "$1" merge -q --no-edit "refs/heads/$BASE" >/dev/null 2>&1 && return 0
@@ -643,15 +660,20 @@ land() {
   sync_base
   merge_base_in "$path" "$inter" || fail "conflicts with $BASE" || return 1
 
-  # The plan moves to the done folder in the branch itself, so it lands with the work.
-  if [ -n "$plan" ] && [ -f "$path/$PLANS/${plan##*/}" ]; then
+  # The plan moves to the done folder in the branch itself, so it lands with the work. A
+  # private plan (ignored by git) moves on disk once the branch has landed.
+  local wplan=''
+  if [ -n "$plan" ]; then
+    if [ "$PRIVATE" = 1 ]; then wplan="$path/$PLANS/${plan##*/}"; else wplan="$path/$PLANS/$DONE/${plan##*/}"; fi
+  fi
+  if [ -n "$plan" ] && [ "$PRIVATE" = 0 ] && [ -f "$path/$PLANS/${plan##*/}" ]; then
     mkdir -p "$path/$PLANS/$DONE"
     git -C "$path" mv "$PLANS/${plan##*/}" "$PLANS/$DONE/${plan##*/}" &&
       git -C "$path" commit -q -m "dangle: plan $id done" || fail "could not move the plan to $DONE/" || return 1
   fi
 
   say "  gate   running (log $log)"
-  while ! run_gate "$path" "$log" "${plan:+$path/$PLANS/$DONE/${plan##*/}}"; do
+  while ! run_gate "$path" "$log" "$wplan"; do
     if [ -z "$fix" ] || [ $fixes -ge "$FIXES" ]; then
       fail "the gate failed (log $log)"; return 1
     fi
@@ -676,7 +698,7 @@ land() {
       merge_base_in "$path" "$inter" || { drop_lock "$STATE/land.lock"; fail "conflicts with $BASE"; return 1; }
       if regate_needed "$old" "$new"; then
         say "  gate   $BASE moved; gating again"
-        run_gate "$path" "$log" "${plan:+$path/$PLANS/$DONE/${plan##*/}}" ||
+        run_gate "$path" "$log" "$wplan" ||
           { drop_lock "$STATE/land.lock"; fail "the gate failed after $BASE moved (log $log)"; return 1; }
       fi
     fi
@@ -685,7 +707,7 @@ land() {
       drop_lock "$STATE/land.lock"; fail "nothing to land: the branch has no changes"; return 1
     fi
     if [ -n "$plan" ]; then
-      msg="$(plan_title "$path/$PLANS/$DONE/${plan##*/}")"
+      msg="$(plan_title "$wplan")"
     elif [ "$(git -C "$path" rev-list --no-merges --count "$new..HEAD")" = 1 ]; then
       msg=$(git -C "$path" log --no-merges -1 --format=%s "$new..HEAD")
     else
@@ -706,6 +728,7 @@ land() {
       fi
       drop_lock "$STATE/land.lock"
       sync_base
+      [ -n "$plan" ] && [ "$PRIVATE" = 1 ] && done_on_disk "$plan"
       if [ -n "$plan" ] && ! is_landed "$id"; then
         # Handed off (a pull request still waiting for CI): skipped by later runs until it lands.
         mkdir -p "$STATE/submitted"; date '+%F %T' > "$STATE/submitted/$id"
@@ -723,6 +746,7 @@ land() {
       continue
     fi
     advance_base "$sha" "$new"
+    [ -n "$plan" ] && [ "$PRIVATE" = 1 ] && done_on_disk "$plan"
     break
   done
   drop_lock "$STATE/land.lock"
@@ -804,7 +828,7 @@ cmd_run() {
   fixagent=${fixagent:-${DANGLE_FIX_AGENT:-$(cfg FIX_AGENT)}}
   [ -n "$(cfg AGENT)$agent" ] || die "no agent: set AGENT= in .dangle/config (dangle init) or pass -a"
   [ -d "$PRIMARY/$PLANS" ] || die "no plans folder $PLANS (set PLANS= in .dangle/config)"
-  if [ -n "$(git -C "$PRIMARY" status --porcelain --untracked-files=all -- "$PLANS")" ] && [ $dry = 0 ]; then
+  if [ "$PRIVATE" = 0 ] && [ -n "$(git -C "$PRIMARY" status --porcelain --untracked-files=all -- "$PLANS")" ] && [ $dry = 0 ]; then
     err "the plans folder has changes that are not committed; a worktree only sees committed plans:"
     git -C "$PRIMARY" status --short -- "$PLANS" >&2
     exit 1
@@ -901,7 +925,7 @@ $f"
     t0=$(date +%s); result=
     if [ ! -f "$f" ]; then
       result="skipped  (landed by another run)"
-    elif ! git cat-file -e "refs/heads/$BASE:$PLANS/${f##*/}" 2>/dev/null; then
+    elif [ "$PRIVATE" = 0 ] && ! git cat-file -e "refs/heads/$BASE:$PLANS/${f##*/}" 2>/dev/null; then
       result="skipped  (not committed on $BASE)"
     elif [ -f "$STATE/submitted/$id" ] && [ -z "$ids" ]; then
       result="skipped  (submitted $(cat "$STATE/submitted/$id"); waiting for it to land)"
@@ -1019,6 +1043,7 @@ cmd_doctor() {
   say "dangle $VERSION in $PRIMARY"
   git show-ref -q --verify "refs/heads/$BASE" && ok "base branch $BASE" || no "base branch '$BASE' does not exist (BASE= in .dangle/config)"
   [ -d "$PRIMARY/$PLANS" ] && ok "plans in $PLANS ($(plan_files | wc -l | tr -d ' ') active)" || no "no plans folder $PLANS (PLANS=)"
+  [ "$PRIVATE" = 0 ] || ok "$PLANS is ignored by git: private plans (copied into worktrees, moved to $DONE/ on disk)"
   [ -f "$DOT/config" ] && ok ".dangle/config" || warn "no .dangle/config: run dangle init"
   if has_hook gate; then ok "gate hook"; else no "no executable .dangle/hooks/gate: nothing would check the work"; fi
   for w in setup teardown regate land lint "done"; do
@@ -1074,6 +1099,7 @@ cmd_audit() {
   [ -d "$path" ] && git worktree remove --force "$path"
   ensure_excluded
   git worktree add -q --detach "$path" "refs/heads/$BASE" || die "could not make a checkout of $BASE"
+  [ "$PRIVATE" = 0 ] || { mkdir -p "$path/$PLANS" && cp -R "$PRIMARY/$PLANS/." "$path/$PLANS/"; }
   trap 'cleanup; git worktree remove --force "$path" 2>/dev/null; exit 130' INT TERM
   report="$STATE/audit.md"
   printf '# dangle audit %s (agent %s)\n\n' "$(date)" "$AGENT_LABEL" > "$report"
@@ -1101,6 +1127,11 @@ cmd_audit() {
   [ -n "$found" ] || { say "  no plan was found done"; return 0; }
   if [ $apply = 0 ]; then
     say "  $(printf '%s\n' $found | wc -l | tr -d ' ') found done. Check them, then: dangle audit --apply$ids (moves them to $PLANS/$DONE/ in one commit)"
+    return 0
+  fi
+  if [ "$PRIVATE" = 1 ]; then
+    for f in $found; do done_on_disk "$f"; done
+    say "  moved to $PLANS/$DONE/ (private plans: not committed)"
     return 0
   fi
   bw=$(base_checkout)
@@ -1157,7 +1188,8 @@ DONE=done
 # The agent: claude (Claude Code, the default), codex, opencode or pi, with an optional
 # :model (claude:sonnet, codex:gpt-5, pi:ollama/qwen3), or a command of your own that takes
 # the prompt last.
-AGENT=$agent
+# Unset, each person's own default applies (~/.config/dangle/config, else claude). Found here:
+# AGENT=$agent
 # FIX_AGENT=claude:sonnet
 # Fix-up runs after a failed gate (0 = none).
 FIXES=1

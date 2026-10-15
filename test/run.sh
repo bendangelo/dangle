@@ -184,6 +184,7 @@ rm -rf .dangle
 echo '{"scripts":{"test":"true"}}' > package.json
 "$DANGLE" init > "$tmp/out" 2>&1
 check "init writes a gate for the project's language" 'grep -q "npm test" .dangle/hooks/gate && grep -q node_modules .dangle/copy && [ -x .dangle/hooks/setup ]'
+check "init leaves the agent to each person" '! grep -q "^AGENT=" .dangle/config'
 
 repo conflict
 "$DANGLE" new side > "$tmp/out" 2>&1
@@ -296,6 +297,14 @@ printf '#!/bin/sh\necho "compiling things"\nsleep 3\nexec "%s" "$@"\n' "$tmp/age
 commit "slow agent"
 "$DANGLE" -y > "$tmp/out" 2>&1
 check "a heartbeat line shows the time and the last line of output" 'grep -q "\.\.\.    agent [0-9]*s  │ compiling things" "$tmp/out" && [ -f s.txt ]'
+
+repo private
+printf 'plans/\n' > .gitignore && git add .gitignore && git commit -qm ignore && git push -q origin main
+plan 010-a.md a.txt
+plan 020-b.md b.txt '<!-- dangle: depends=010 -->'
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "private plans (ignored by git) run, land, and move to done/ on disk" '[ -f a.txt ] && [ -f b.txt ] && [ -f plans/done/010-a.md ] && [ -f plans/done/020-b.md ] && [ -z "$(git ls-files plans)" ]'
+check "a private plan lands without its plan file in the commit" '! git show --stat HEAD | grep -q "plans/"'
 
 echo
 echo "$pass passed, $failed failed"
