@@ -31,7 +31,9 @@ landing (straight onto a branch, or through pull requests and CI).
 ## Install
 
 ```sh
-mise use -g github:bendangelo/dangle
+mise use -g github:bendangelo/dangle@0.1.1
+# (plain `github:bendangelo/dangle` works too, once a release is a day old: mise's
+#  minimum_release_age)
 # or
 curl -fsSL https://raw.githubusercontent.com/bendangelo/dangle/main/install.sh | sh
 ```
