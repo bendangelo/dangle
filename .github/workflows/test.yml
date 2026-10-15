@@ -7,7 +7,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: shellcheck -s sh -S warning -e SC3043 bin/dangle install.sh examples/land/* examples/regate-docs-only
         if: runner.os == 'Linux'
       - run: test/run.sh
@@ -19,7 +19,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: |
           v=${GITHUB_REF_NAME#v}
           mkdir -p "dangle-$v/bin" && cp bin/dangle "dangle-$v/bin/" && cp -r README.md LICENSE skill examples "dangle-$v/"

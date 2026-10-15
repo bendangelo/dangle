@@ -58,7 +58,10 @@ progress_bar() {
   printf '%s)' "$bar"
 }
 
-minutes() { printf '%dm' $(( ($2 - $1 + 59) / 60 )); }
+minutes() {
+  local d=$(($2 - $1))
+  if [ $d -lt 60 ]; then printf '%ds' $d; elif [ $d -lt 3600 ]; then printf '%dm' $((d / 60)); else printf '%dh%02dm' $((d / 3600)) $((d % 3600 / 60)); fi
+}
 
 # ---------------------------------------------------------------- repository and config
 

@@ -124,7 +124,7 @@ EOF
 chmod +x .dangle/hooks/land
 commit "land hook"
 "$DANGLE" -y > "$tmp/out" 2>&1
-check "a land hook replaces the squash" '[ -f a.txt ] && [ "$(git log -1 --format=%p | wc -w)" = 2 ] && git ls-remote origin | grep -q landed-plan-010'
+check "a land hook replaces the squash" '[ -f a.txt ] && [ "$(git log -1 --format=%p | wc -w | tr -d ' ')" = 2 ] && git ls-remote origin | grep -q landed-plan-010'
 
 repo prhook
 plan 010-a.md a.txt
