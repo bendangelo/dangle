@@ -9,7 +9,7 @@
 set -u
 LC_ALL=C
 export LC_ALL
-VERSION=0.1.8
+VERSION=0.1.9
 
 # ---------------------------------------------------------------- output
 
@@ -162,9 +162,9 @@ settings() {
 # A preset is the headless form of a known agent CLI. Anything else is a command of your own.
 preset() {
   case $1 in
-    pi) echo "pi -p --approve" ;;
+    pi) echo "pi -p --mode json --approve" ;;
     opencode) echo "opencode run --auto" ;;
-    claude) echo "claude -p --dangerously-skip-permissions" ;;
+    claude) echo "claude -p --output-format stream-json --verbose --dangerously-skip-permissions" ;;
     codex) echo "codex exec --dangerously-bypass-approvals-and-sandbox" ;;
     *) return 1 ;;
   esac
@@ -217,10 +217,55 @@ run_limited() {
     ( sleep "$t"; kill -TERM "$CHILD" 2>/dev/null ) &
     watch=$!
   fi
+  echo "$CHILD" > "$STATE/child.$$"
   wait "$CHILD"; rc=$?
+  rm -f "$STATE/child.$$"
   [ -n "$watch" ] && kill "$watch" 2>/dev/null
   CHILD=
   return $rc
+}
+
+# readable: turns an agent's JSON event stream (pi --mode json, claude stream-json) into one
+# line per step, `→ bash cargo test` or the agent's text, so the log and the heartbeat say
+# what it is doing. Any other line passes through as it is.
+readable() {
+  awk '
+    function str(key,   m, v) {
+      if (!match($0, "\"" key "\":\"([^\"\\\\]|\\\\.)*\"")) return ""
+      v = substr($0, RSTART + length(key) + 4, RLENGTH - length(key) - 5)
+      gsub(/\\n/, "\n", v); gsub(/\\t/, " ", v); gsub(/\\"/, "\"", v); gsub(/\\\\/, "\\", v)
+      return v
+    }
+    function arg(   k, v) {
+      split("command file_path path pattern", k, " ")
+      for (i = 1; i <= 4; i++) if ((v = str(k[i])) != "") return substr(v, 1, 120)
+      return ""
+    }
+    function texts(   rest, t, out) {
+      rest = $0; out = ""
+      while (match(rest, /"type":"text","text":"([^"\\]|\\.)*"/)) {
+        t = substr(rest, RSTART + 22, RLENGTH - 23); rest = substr(rest, RSTART + RLENGTH)
+        gsub(/\\n/, "\n", t); gsub(/\\"/, "\"", t); gsub(/\\\\/, "\\", t)
+        if (t ~ /[^[:space:]]/) out = out (out == "" ? "" : "\n") t
+      }
+      return out
+    }
+    !/^\{/ { print; fflush(); next }
+    /"type":"tool_execution_start"/ { print "→ " str("toolName") " " arg(); fflush(); next }
+    /"type":"message_end"/ && /"role":"assistant"/ { t = texts(); if (t != "") print t; e = str("errorMessage"); if (e != "") print "error: " e; fflush(); next }
+    /^\{"type":"assistant"/ {
+      t = texts(); if (t != "") print t
+      rest = $0
+      while (match(rest, /"type":"tool_use"[^}]*"name":"[^"]*"/)) {
+        seg = substr(rest, RSTART, RLENGTH); rest = substr(rest, RSTART + RLENGTH)
+        sub(/.*"name":"/, "", seg); sub(/"$/, "", seg)
+        line = $0; $0 = rest; a = arg(); $0 = line
+        print "→ " seg " " a
+      }
+      fflush(); next
+    }
+    /"type":"result"/ && /"session_id"/ { print "[done] " str("subtype"); fflush(); next }
+  '
 }
 
 # heartbeat <what> <log>: every HEARTBEAT (5m) while something runs, one line: how long it
@@ -290,6 +335,8 @@ unclaim() { drop_lock "$STATE/claims/$1"; }
 cleanup() {
   stop_heartbeat
   [ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null
+  # An agent started in a subshell (run_agent) records its pid here.
+  [ -f "$STATE/child.$$" ] && kill -TERM "$(cat "$STATE/child.$$")" 2>/dev/null && rm -f "$STATE/child.$$"
   local d
   for d in "$STATE"/claims/*; do [ -d "$d" ] && drop_lock "$d"; done
   drop_lock "$STATE/land.lock"
@@ -589,9 +636,13 @@ run_agent() {
     cd "$dir" || exit 1
     set -f; set -- $AGENT_CMD; set +f
     DANGLE=1 DANGLE_MODEL=${AGENT_LABEL#*:}; export DANGLE DANGLE_MODEL
-    run_limited "$AGENT_SECS" "$@" "$prompt" < /dev/null >> "$log" 2>&1
+    # The raw event stream goes to <log>.jsonl; the log itself gets one readable line per step.
+    { run_limited "$AGENT_SECS" "$@" "$prompt" < /dev/null 2>&1; echo $? > "$log.rc"; } |
+      tee -a "${log%.log}.jsonl" | readable >> "$log"
+    exit "$(cat "$log.rc" 2>/dev/null || echo 1)"
   )
   rc=$?
+  rm -f "$log.rc"
   stop_heartbeat
   [ -n "$tailer" ] && kill "$tailer" 2>/dev/null
   [ $rc = 124 ] && say "  agent  stopped after $(cfg AGENT_TIMEOUT 4h)"

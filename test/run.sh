@@ -151,13 +151,13 @@ cd "$tmp/agents" || exit 1
 printf 'BASE=main\nPLANS=plans\nAGENT=claude:sonnet\nALIAS_cheap=claude:haiku\nALIAS_local=pi:ollama-local/qwen3.8:latest\n' > .dangle/config
 lib="$tmp/lib.sh"; sed 's/^main "\$@"$//' "$DANGLE" > "$lib"
 res() { sh -c '. "$1"; find_repo; settings; resolve_agent "$2" "$(cfg AGENT)"; printf "%s|%s" "$AGENT_LABEL" "$AGENT_CMD"' sh "$lib" "$1"; }
-check "preset with a model" '[ "$(res claude:haiku)" = "claude:haiku|claude -p --dangerously-skip-permissions --model haiku" ]'
-check "a model with a colon stays whole" '[ "$(res pi:ollama-local/qwen3.8:latest)" = "pi:ollama-local/qwen3.8:latest|pi -p --approve --model ollama-local/qwen3.8:latest" ]'
-check "a bare model uses the default agent" '[ "$(res opus)" = "claude:opus|claude -p --dangerously-skip-permissions --model opus" ]'
-check "an alias" '[ "$(res local)" = "pi:ollama-local/qwen3.8:latest|pi -p --approve --model ollama-local/qwen3.8:latest" ]'
+check "preset with a model" '[ "$(res claude:haiku)" = "claude:haiku|claude -p --output-format stream-json --verbose --dangerously-skip-permissions --model haiku" ]'
+check "a model with a colon stays whole" '[ "$(res pi:ollama-local/qwen3.8:latest)" = "pi:ollama-local/qwen3.8:latest|pi -p --mode json --approve --model ollama-local/qwen3.8:latest" ]'
+check "a bare model uses the default agent" '[ "$(res opus)" = "claude:opus|claude -p --output-format stream-json --verbose --dangerously-skip-permissions --model opus" ]'
+check "an alias" '[ "$(res local)" = "pi:ollama-local/qwen3.8:latest|pi -p --mode json --approve --model ollama-local/qwen3.8:latest" ]'
 check "extra arguments pass through" '[ "$(res "opencode --variant high")" = "opencode|opencode run --auto --variant high" ]'
 printf 'BASE=main\nPLANS=plans\n' > .dangle/config
-check "with no AGENT the default is Claude Code" '[ "$(res opus)" = "claude:opus|claude -p --dangerously-skip-permissions --model opus" ]'
+check "with no AGENT the default is Claude Code" '[ "$(res opus)" = "claude:opus|claude -p --output-format stream-json --verbose --dangerously-skip-permissions --model opus" ]'
 
 repo manual
 "$DANGLE" new feature > "$tmp/out" 2>&1
@@ -284,7 +284,7 @@ repo userconfig
 mkdir -p "$XDG_CONFIG_HOME/dangle"
 printf 'AGENT=pi:ollama-local/qwen3.8:latest\nALIAS_q=pi:x\n' > "$XDG_CONFIG_HOME/dangle/config"
 printf 'BASE=main\nPLANS=plans\n' > .dangle/config
-check "the user config sets the agent when the repository does not" '[ "$(res opus)" = "pi:opus|pi -p --approve --model opus" ] && [ "$(res q)" = "pi:x|pi -p --approve --model x" ]'
+check "the user config sets the agent when the repository does not" '[ "$(res opus)" = "pi:opus|pi -p --mode json --approve --model opus" ] && [ "$(res q)" = "pi:x|pi -p --mode json --approve --model x" ]'
 printf 'BASE=main\nPLANS=plans\nAGENT=codex\n' > .dangle/config
 check "the repository config wins over the user config" '[ "$(res o3)" = "codex:o3|codex exec --dangerously-bypass-approvals-and-sandbox --model o3" ]'
 rm -rf "$XDG_CONFIG_HOME/dangle"
@@ -329,6 +329,22 @@ sleep 1
 wait $r1; export rc1=$?; wait $r2; export rc2=$?
 check "two runners in two terminals: every plan lands exactly once" '[ $rc1 = 0 ] && [ $rc2 = 0 ] && [ -f a.txt ] && [ -f b.txt ] && [ -f c.txt ] && [ -f d.txt ] && [ "$(git log --format=%s main | grep -c "^Plan ")" = 4 ]'
 check "two runners: both did some of the work" 'grep -q " landed " "$tmp/out1" && grep -q " landed " "$tmp/out2"'
+
+repo jsonagent
+plan 010-a.md a.txt
+commit
+cat > "$tmp/json-agent" <<'EOF2'
+#!/bin/sh
+echo '{"type":"tool_execution_start","toolName":"bash","args":{"command":"cargo test -p widgets"}}'
+sleep 3
+echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"All done."}]}}'
+exec "$DANGLE_TEST_AGENT" "$@" > /dev/null
+EOF2
+chmod +x "$tmp/json-agent"
+printf 'BASE=main\nPLANS=plans\nAGENT=%s\nHEARTBEAT=1s\n' "$tmp/json-agent" > .dangle/config
+commit "json agent"
+DANGLE_TEST_AGENT="$tmp/agent" "$DANGLE" -y > "$tmp/out" 2>&1
+check "a JSON event stream becomes readable lines in the log and the heartbeat" 'grep -q "agent [0-9]*s  │ → bash cargo test -p widgets" "$tmp/out" && grep -q "^All done.$" .git/dangle/logs/010.log && [ -s .git/dangle/logs/010.jsonl ] && [ -f a.txt ]'
 
 echo
 echo "$pass passed, $failed failed"

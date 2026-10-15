@@ -176,13 +176,17 @@ echo 'AGENT=pi:ollama-local/qwen3.8:latest' >> ~/.config/dangle/config
 
 | Spec | Runs |
 |---|---|
-| `claude` (the default), `claude:haiku` | `claude -p --dangerously-skip-permissions [--model …]` |
+| `claude` (the default), `claude:haiku` | `claude -p --output-format stream-json --verbose --dangerously-skip-permissions [--model …]` |
 | `codex`, `codex:gpt-5` | `codex exec --dangerously-bypass-approvals-and-sandbox [--model …]` |
 | `opencode`, `opencode:anthropic/claude-sonnet-5-5` | `opencode run --auto [--model …]` |
-| `pi`, `pi:ollama/qwen3` | `pi -p --approve [--model …]` |
+| `pi`, `pi:ollama/qwen3` | `pi -p --mode json --approve [--model …]` |
 | `opus` | the default agent with this model |
 | `cheap` | `ALIAS_cheap=claude:haiku` from the config |
 | `./scripts/my-agent` | your own command |
+
+pi and Claude Code run in their streaming modes, and dangle turns each event into one line of
+the log: `→ bash cargo test`, `→ Edit src/lib.rs`, or the agent's text. The raw events are
+kept beside it (`<id>.jsonl`). That is what the heartbeat shows while an agent works.
 
 Words after the spec are passed on (`AGENT=opencode --variant high`). The prompt is always the
 last argument. An agent runs with `DANGLE=1`, `DANGLE_PLAN`, `DANGLE_PLAN_FILE`,
