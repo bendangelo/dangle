@@ -153,7 +153,8 @@ settings() {
   REMOTE=${DANGLE_REMOTE:-$(cfg REMOTE origin)}
   if [ "$REMOTE" = none ] || ! git remote get-url "$REMOTE" >/dev/null 2>&1; then REMOTE=; fi
   TIMEOUT_BIN=
-  if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout
+  if [ "${DANGLE_TIMEOUT_BIN-}" = none ]; then :
+  elif command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout
   elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN=gtimeout; fi
 }
 
@@ -214,7 +215,10 @@ run_limited() {
   else
     "$@" &
     CHILD=$!
-    ( sleep "$t"; kill -TERM "$CHILD" 2>/dev/null ) &
+    # The watcher holds no output open (a pipe after dangle would wait for it) and takes its
+    # sleep with it when it is stopped.
+    ( s=''; trap '[ -n "$s" ] && kill "$s" 2>/dev/null; exit 0' TERM
+      sleep "$t" & s=$!; wait "$s" && kill -TERM "$CHILD" 2>/dev/null ) < /dev/null > /dev/null 2>&1 &
     watch=$!
   fi
   echo "$CHILD" > "$STATE/child.$$"

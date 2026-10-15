@@ -11,6 +11,9 @@ jobs:
       - run: shellcheck -s sh -S warning -e SC3043 bin/dangle install.sh examples/land/* examples/regate-docs-only
         if: runner.os == 'Linux'
       - run: test/run.sh
+      - name: test/run.sh without a timeout command (as on macOS without coreutils)
+        run: DANGLE_TIMEOUT_BIN=none test/run.sh
+        if: runner.os == 'Linux'
       - run: bin/dangle skill --print | diff - skill/SKILL.md
   release:
     needs: test
