@@ -9,7 +9,7 @@
 set -u
 LC_ALL=C
 export LC_ALL
-VERSION=0.1.4
+VERSION=0.1.5
 
 # ---------------------------------------------------------------- output
 
@@ -409,11 +409,21 @@ plan_field() {
 plan_done_when() { sed -n 's/^[*_]*Done when:[*_]*[^`]*`\([^`]*\)`.*/\1/p' "$1" | head -n 1; }
 
 # Ids of plans landed on the base branch: the files in <plans>/<done>/ there.
+# Cached per commit of the base branch: a run asks this for every plan, again and again.
 landed_ids() {
-  git ls-tree --name-only "refs/heads/$BASE" -- "$PLANS/$DONE/" 2>/dev/null |
-    while IFS= read -r f; do case $f in *.md) plan_id "$f" ;; esac; done
+  local sha cache
+  sha=$(git rev-parse -q --verify "refs/heads/$BASE") || return 0
+  cache="$STATE/landed-$sha"
+  if [ ! -f "$cache" ]; then
+    rm -f "$STATE"/landed-*
+    git ls-tree --name-only "refs/heads/$BASE" -- "$PLANS/$DONE/" 2>/dev/null |
+      sed -n 's|.*/||; s/\.md$//p' |
+      sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}-//; s/^([0-9]+)(-.*)?$/\1/' > "$cache.$$" &&
+      mv "$cache.$$" "$cache"
+  fi
+  cat "$cache"
 }
-is_landed() { landed_ids | grep -Fqx "$1"; }
+is_landed() { landed_ids | grep -Fqx -- "$1"; }
 
 # find_plan <id or part of a name>: the active plan file.
 find_plan() {
