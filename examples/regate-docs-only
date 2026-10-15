@@ -1,0 +1,9 @@
+#!/bin/sh
+# .dangle/hooks/regate <old base> <new base>: the base branch moved while a plan was gated.
+# Exit 0 = gate again; exit 1 = land without a second gate.
+#
+# This one skips the second gate when the base gained only documentation.
+if git diff --name-only "$1" "$2" | grep -qvE '^(docs/|.*\.md$)'; then
+  exit 0
+fi
+exit 1

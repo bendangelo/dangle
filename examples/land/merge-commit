@@ -1,0 +1,8 @@
+#!/bin/sh
+# .dangle/hooks/land: land with a merge commit (keeping the branch's own commits) instead of
+# dangle's default squash. Runs in the worktree; the base branch is checked out in the main
+# checkout, which dangle has already brought up to date and checked is clean.
+set -e
+cd "$DANGLE_PRIMARY"
+git merge -q --no-ff -F "$DANGLE_MESSAGE_FILE" "$DANGLE_BRANCH"
+[ -z "$DANGLE_REMOTE" ] || git push -q "$DANGLE_REMOTE" "$DANGLE_BASE"

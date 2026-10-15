@@ -1,0 +1,1189 @@
+#!/bin/sh
+# dangle: a carrot on a stick for your coding agent.
+#
+# It works through a folder of plan files, one at a time: each plan gets its own git
+# worktree, your agent implements it, your gate checks it, and only what passes lands on
+# the base branch. Everything a project needs to change is a file in .dangle/ (see README).
+#
+# https://github.com/bendangelo/dangle · MIT license
+set -u
+LC_ALL=C
+export LC_ALL
+VERSION=0.1.0
+
+# ---------------------------------------------------------------- output
+
+say() { printf '%s\n' "$*"; }
+err() { printf 'dangle: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+QUIET=0
+fancy() { [ "$QUIET" = 0 ] && [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; }
+
+art_stick() {
+  fancy || return 0
+  cat <<'EOF'
+
+   o
+    \
+     \_______________________
+                             |
+                             |
+                             ?
+EOF
+}
+
+art_carrot() {
+  fancy || return 0
+  cat <<'EOF'
+
+        \|/
+       \\|//
+       .-'-.
+       |   |
+       |   |
+        \ /
+         V
+EOF
+}
+
+# progress <done> <total>: the model (o) walks along the stick toward the carrot ())
+progress_bar() {
+  local done="$1" total="$2" width=30 pos i bar
+  [ "$total" -gt 0 ] || total=1
+  pos=$((done * width / total))
+  bar='['
+  i=0; while [ $i -lt $pos ]; do bar="$bar="; i=$((i + 1)); done
+  bar="${bar}o"
+  while [ $i -lt $width ]; do bar="$bar."; i=$((i + 1)); done
+  printf '%s)' "$bar"
+}
+
+minutes() { printf '%dm' $(( ($2 - $1 + 59) / 60 )); }
+
+# ---------------------------------------------------------------- repository and config
+
+find_repo() {
+  git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
+  COMMON=$(git rev-parse --path-format=absolute --git-common-dir) || die "cannot find the git directory"
+  PRIMARY=$(dirname "$COMMON")
+  [ -d "$PRIMARY/.git" ] || die "dangle needs a normal (non-bare) repository"
+  STATE="$COMMON/dangle"
+  DOT="$PRIMARY/.dangle"
+  HOOKS="$DOT/hooks"
+  mkdir -p "$STATE/claims" "$STATE/logs" "$STATE/results"
+}
+
+trim() { printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+
+# .dangle/config is KEY=value lines. It is read, never run: a value is taken literally.
+load_config() {
+  local f="$DOT/config" line key val
+  [ -f "$f" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(trim "$line")
+    case $line in ''|'#'*) continue ;; *=*) ;; *) err "config: ignoring '$line'"; continue ;; esac
+    key=$(trim "${line%%=*}"); val=$(trim "${line#*=}")
+    case $key in ''|[0-9]*|*[!A-Za-z0-9_]*) err "config: ignoring key '$key'"; continue ;; esac
+    case $val in \"*\") val=${val#\"}; val=${val%\"} ;; \'*\') val=${val#\'}; val=${val%\'} ;; esac
+    eval "CFG_$key=\$val"
+  done < "$f"
+}
+
+# cfg KEY [default]
+cfg() {
+  local v
+  eval "v=\${CFG_$1-}"
+  if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "${2-}"; fi
+}
+
+detect_base() {
+  local b
+  b=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null) && { printf '%s' "${b#origin/}"; return; }
+  for b in main master; do
+    git show-ref -q --verify "refs/heads/$b" && { printf '%s' "$b"; return; }
+  done
+  git -C "$PRIMARY" symbolic-ref -q --short HEAD
+}
+
+detect_plans() {
+  local d
+  for d in docs/superpowers/plans docs/plans plans; do
+    [ -d "$PRIMARY/$d" ] && { printf '%s' "$d"; return; }
+  done
+  printf 'docs/plans'
+}
+
+to_secs() {
+  case $1 in
+    *h) echo $(( ${1%h} * 3600 )) ;;
+    *m) echo $(( ${1%m} * 60 )) ;;
+    *s) echo "${1%s}" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+settings() {
+  load_config
+  BASE=${DANGLE_BASE:-$(cfg BASE "$(detect_base)")}
+  PLANS=$(cfg PLANS "$(detect_plans)")
+  DONE=$(cfg DONE "done")
+  WORKTREES=$(cfg WORKTREES .worktrees)
+  PREFIX=$(cfg BRANCH_PREFIX plan-)
+  FIXES=$(cfg FIXES 1)
+  MAX_LINES=$(cfg MAX_LINES 300)
+  AGENT_SECS=$(to_secs "$(cfg AGENT_TIMEOUT 4h)")
+  GATE_SECS=$(to_secs "$(cfg GATE_TIMEOUT 60m)")
+  REMOTE=${DANGLE_REMOTE:-$(cfg REMOTE origin)}
+  if [ "$REMOTE" = none ] || ! git remote get-url "$REMOTE" >/dev/null 2>&1; then REMOTE=; fi
+  TIMEOUT_BIN=
+  if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout
+  elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN=gtimeout; fi
+}
+
+# ---------------------------------------------------------------- agents
+
+# A preset is the headless form of a known agent CLI. Anything else is a command of your own.
+preset() {
+  case $1 in
+    pi) echo "pi -p --approve" ;;
+    opencode) echo "opencode run --auto" ;;
+    claude) echo "claude -p --dangerously-skip-permissions" ;;
+    codex) echo "codex exec --dangerously-bypass-approvals-and-sandbox" ;;
+    *) return 1 ;;
+  esac
+}
+
+# resolve_agent <spec> <default spec>: sets AGENT_CMD (words) and AGENT_LABEL.
+# A spec is `name[:model] [extra args]`: a preset (pi, opencode, claude, codex), an
+# ALIAS_<name> from the config, a command of your own, or a bare model for the default agent.
+resolve_agent() {
+  local spec="$1" fallback="${2-}" first rest name model n=0 alias
+  while :; do
+    first=${spec%% *}; rest=${spec#"$first"}
+    name=${first%%:*}; model=
+    case $first in *:*) model=${first#*:} ;; esac
+    case $name in *[!A-Za-z0-9_]*|'') alias= ;; *) alias=$(cfg "ALIAS_$name") ;; esac
+    [ -n "$alias" ] && [ $n -lt 5 ] || break
+    if [ -n "$model" ]; then spec="${alias%%:*}:$model${alias#"${alias%% *}"}$rest"; else spec="$alias$rest"; fi
+    n=$((n + 1))
+  done
+  if preset "$name" >/dev/null; then
+    AGENT_CMD="$(preset "$name")${model:+ --model $model}$rest"
+    AGENT_LABEL="$name${model:+:$model}"
+  elif case $first in */*) true ;; *) command -v "$first" >/dev/null 2>&1 ;; esac; then
+    AGENT_CMD="$spec"; AGENT_LABEL="$first"
+  elif [ -n "$fallback" ] && [ "$fallback" != "$spec" ]; then
+    # A bare model: the default agent with this model.
+    local dname
+    resolve_agent "$fallback" ""
+    dname=${AGENT_LABEL%%:*}
+    preset "$dname" >/dev/null || die "'$spec' is not an agent, and the default agent ($dname) is not a preset to give a model to"
+    resolve_agent "$dname:$spec" ""
+  else
+    die "unknown agent '$spec' (presets: pi, opencode, claude, codex; or an ALIAS_ in .dangle/config, or a command)"
+  fi
+}
+
+# ---------------------------------------------------------------- running things
+
+# run_limited <secs> <cmd...>: runs a command with a time limit. Ctrl-C stops it too.
+CHILD=
+run_limited() {
+  local t="$1" rc watch=''
+  shift
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" -k 30 "$t" "$@" &
+    CHILD=$!
+  else
+    "$@" &
+    CHILD=$!
+    ( sleep "$t"; kill -TERM "$CHILD" 2>/dev/null ) &
+    watch=$!
+  fi
+  wait "$CHILD"; rc=$?
+  [ -n "$watch" ] && kill "$watch" 2>/dev/null
+  CHILD=
+  return $rc
+}
+
+# hook <name> <dir> [args...]: runs .dangle/hooks/<name> in <dir> if it exists.
+hook() {
+  local name="$1" dir="$2"
+  shift 2
+  [ -x "$HOOKS/$name" ] || return 0
+  ( cd "$dir" && DANGLE_HOOK=$name "$HOOKS/$name" "$@" )
+}
+has_hook() { [ -x "$HOOKS/$1" ]; }
+
+export_ctx() { # <worktree> <branch>
+  DANGLE_PRIMARY=$PRIMARY DANGLE_WORKTREE=$1 DANGLE_BRANCH=$2 DANGLE_BASE=$BASE
+  export DANGLE_PRIMARY DANGLE_WORKTREE DANGLE_BRANCH DANGLE_BASE
+}
+
+# ---------------------------------------------------------------- locks and claims
+
+# take_lock <dir> <what>: waits for a lock held by a live process; clears a dead one's.
+take_lock() {
+  local dir="$1" what="$2" pid said=''
+  while ! mkdir "$dir" 2>/dev/null; do
+    pid=$(cat "$dir/pid" 2>/dev/null || true)
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -rf "$dir"; continue; fi
+    [ -n "$said" ] || { say "  waiting for $what${pid:+ (pid $pid)}"; said=1; }
+    sleep 3
+  done
+  echo $$ > "$dir/pid"
+}
+drop_lock() { [ "$(cat "$1/pid" 2>/dev/null)" = $$ ] && rm -rf "$1"; return 0; }
+
+# claim <id>: 0 when this process now owns the plan, 1 when another live dangle runs it.
+claim() {
+  local dir="$STATE/claims/$1" pid
+  while ! mkdir "$dir" 2>/dev/null; do
+    pid=$(cat "$dir/pid" 2>/dev/null || true)
+    [ "$pid" = $$ ] && return 0
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then return 1; fi
+    [ -n "$pid" ] || sleep 1
+    rm -rf "$dir"
+  done
+  echo $$ > "$dir/pid"
+}
+unclaim() { drop_lock "$STATE/claims/$1"; }
+
+cleanup() {
+  [ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null
+  local d
+  for d in "$STATE"/claims/*; do [ -d "$d" ] && drop_lock "$d"; done
+  drop_lock "$STATE/land.lock"
+}
+
+# ---------------------------------------------------------------- the base branch
+
+# The worktree that has the base branch checked out, if any (usually the main checkout).
+base_checkout() {
+  git worktree list --porcelain | awk -v b="refs/heads/$BASE" '
+    /^worktree /{w=substr($0,10)} $0=="branch " b {print w; exit}'
+}
+
+require_clean_base() {
+  local bw
+  bw=$(base_checkout)
+  [ -n "$bw" ] || return 0
+  if [ -n "$(git -C "$bw" status --porcelain --untracked-files=no)" ]; then
+    err "$bw has uncommitted changes on $BASE; commit or stash them first:"
+    git -C "$bw" status --short --untracked-files=no >&2
+    exit 1
+  fi
+}
+
+# advance_base <new sha> <old sha>: moves the base branch forward, and its checkout with it.
+advance_base() {
+  local bw
+  bw=$(base_checkout)
+  if [ -n "$bw" ]; then
+    git -C "$bw" merge -q --ff-only "$1" || die "could not fast-forward $BASE in $bw"
+  else
+    git update-ref "refs/heads/$BASE" "$1" "$2" || die "could not move $BASE"
+  fi
+}
+
+# sync_base: brings the local base branch up to date with the remote. Local commits that are
+# not pushed yet (plans, notes) are rebased onto the remote's.
+sync_base() {
+  [ -n "$REMOTE" ] || return 0
+  local here there bw
+  if ! git fetch -q "$REMOTE" "$BASE" 2>/dev/null; then
+    err "could not fetch $REMOTE/$BASE; going on with the local $BASE"
+    return 0
+  fi
+  here=$(git rev-parse "refs/heads/$BASE"); there=$(git rev-parse "refs/remotes/$REMOTE/$BASE")
+  [ "$here" = "$there" ] && return 0
+  if git merge-base --is-ancestor "$here" "$there"; then
+    advance_base "$there" "$here"
+  elif git merge-base --is-ancestor "$there" "$here"; then
+    return 0
+  else
+    bw=$(base_checkout)
+    [ -n "$bw" ] || die "$BASE and $REMOTE/$BASE have diverged; rebase $BASE first"
+    git -C "$bw" rebase -q "$REMOTE/$BASE" >/dev/null 2>&1 || {
+      git -C "$bw" rebase --abort 2>/dev/null
+      die "$BASE and $REMOTE/$BASE have diverged and do not rebase cleanly; fix $BASE by hand"
+    }
+  fi
+}
+
+# ---------------------------------------------------------------- worktrees
+
+wt_path() { printf '%s/%s/%s' "$PRIMARY" "$WORKTREES" "$1"; }
+
+ensure_excluded() {
+  local ex="$COMMON/info/exclude"
+  mkdir -p "$COMMON/info"
+  git -C "$PRIMARY" check-ignore -q "$WORKTREES/x" 2>/dev/null && return 0
+  printf '/%s/\n' "$WORKTREES" >> "$ex"
+}
+
+# copy_into <worktree>: the paths in .dangle/copy, copied (copy-on-write where the disk can)
+# or linked from the main checkout. Lines: `path`, `link path`, globs allowed, # comments.
+copy_into() {
+  local dst="$1" line kind p
+  [ -f "$DOT/copy" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(trim "$line")
+    case $line in ''|'#'*) continue ;; 'link '*) kind='link'; line=$(trim "${line#link }") ;; *) kind='copy' ;; esac
+    for p in $(cd "$PRIMARY" && eval "printf '%s\n' $line" 2>/dev/null); do
+      [ -e "$PRIMARY/$p" ] || continue
+      [ -e "$dst/$p" ] && continue
+      mkdir -p "$(dirname "$dst/$p")"
+      if [ $kind = link ]; then
+        ln -s "$PRIMARY/$p" "$dst/$p"
+      elif ! cp -a --reflink=auto "$PRIMARY/$p" "$dst/$p" 2>/dev/null; then
+        cp -Rc "$PRIMARY/$p" "$dst/$p" 2>/dev/null || cp -R "$PRIMARY/$p" "$dst/$p"
+      fi
+    done
+  done < "$DOT/copy"
+}
+
+# new_worktree <branch> [base]: creates (or re-opens) the branch's worktree, copies the
+# files in .dangle/copy, runs the setup hook.
+new_worktree() {
+  local branch="$1" from="${2:-$BASE}" path
+  path=$(wt_path "$branch")
+  [ -e "$path" ] && die "$path already exists"
+  ensure_excluded
+  mkdir -p "$(dirname "$path")"
+  if git show-ref -q --verify "refs/heads/$branch"; then
+    git worktree add -q "$path" "$branch" || return 1
+  else
+    git worktree add -q -b "$branch" "$path" "$from" || return 1
+  fi
+  copy_into "$path"
+  export_ctx "$path" "$branch"
+  hook setup "$path" || { err "the setup hook failed in $path"; return 1; }
+}
+
+# remove_worktree <branch> [force]: runs the teardown hook, removes the worktree and branch.
+remove_worktree() {
+  local branch="$1" force="${2-}" path
+  path=$(wt_path "$branch")
+  if [ -d "$path" ]; then
+    export_ctx "$path" "$branch"
+    hook teardown "$path" || err "the teardown hook failed (going on)"
+    git worktree remove ${force:+--force} "$path" || return 1
+  fi
+  git worktree prune
+  if git show-ref -q --verify "refs/heads/$branch"; then
+    if [ -n "$force" ]; then git branch -q -D "$branch"; else git branch -q -d "$branch"; fi
+  fi
+}
+
+# ---------------------------------------------------------------- plans
+
+plan_files() {
+  local f
+  for f in "$PRIMARY/$PLANS"/*.md; do
+    [ -f "$f" ] || continue
+    case ${f##*/} in README.md|readme.md|INDEX.md) continue ;; esac
+    printf '%s\n' "$f"
+  done
+}
+
+# The id of a plan file: its number (2026-10-14-865-name.md and 865-name.md are 865), or
+# without one, its name without a leading date.
+plan_id() {
+  basename "$1" .md | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}-//; s/^([0-9]+)(-.*)?$/\1/'
+}
+plan_title() { sed -n 's/^#[[:space:]]*//p' "$1" | head -n 1; }
+# plan_field <file> <key>: from the header comment `<!-- dangle: depends=1,2 agent=claude:sonnet -->`
+plan_field() {
+  sed -n 's/.*<!--[[:space:]]*dangle:\(.*\)-->.*/\1/p' "$1" | head -n 1 | tr ' ' '\n' |
+    sed -n "s/^$2=//p" | head -n 1
+}
+plan_done_when() { sed -n 's/^[*_]*Done when:[*_]*[^`]*`\([^`]*\)`.*/\1/p' "$1" | head -n 1; }
+
+# Ids of plans landed on the base branch: the files in <plans>/<done>/ there.
+landed_ids() {
+  git ls-tree --name-only "refs/heads/$BASE" -- "$PLANS/$DONE/" 2>/dev/null |
+    while IFS= read -r f; do case $f in *.md) plan_id "$f" ;; esac; done
+}
+is_landed() { landed_ids | grep -Fqx "$1"; }
+
+# find_plan <id or part of a name>: the active plan file.
+find_plan() {
+  local want="$1" f hits='' n=0
+  for f in $(plan_files); do
+    [ "$(plan_id "$f")" = "$want" ] && { printf '%s' "$f"; return 0; }
+  done
+  for f in $(plan_files); do
+    case ${f##*/} in *"$want"*) hits="$hits $f"; n=$((n + 1)) ;; esac
+  done
+  [ $n = 1 ] && { printf '%s' "${hits# }"; return 0; }
+  [ $n = 0 ] && return 1
+  err "'$want' matches $n plans:$hits"
+  return 2
+}
+
+# unmet <file>: the dependencies of a plan that have not landed, one per line.
+unmet() {
+  local d
+  for d in $(plan_field "$1" depends | tr ',' ' '); do
+    is_landed "$d" || printf '%s\n' "$d"
+  done
+}
+
+# ---------------------------------------------------------------- prompts
+
+DEFAULT_PROMPT='You are working in a git worktree of this repository, on branch {{branch}}.
+
+Implement the plan in {{plan}}. Read it in full first, then follow the repository'"'"'s own
+instructions (AGENTS.md, CLAUDE.md, and any skills or files the plan names).
+
+- Commit your work on this branch as you go. Earlier work may already be committed here:
+  continue from it.
+- Do not merge, push, rebase, switch branches, or move or edit the plan file. dangle lands
+  this branch after you finish, and only if its gate passes.
+- Before you stop, run the gate and make it pass: {{gate}}
+- If the plan cannot be done as written, commit what is safe and say why in your last message.'
+
+DEFAULT_FIX_PROMPT='The gate failed for the work on branch {{branch}}, which implements the plan in {{plan}}.
+
+The end of the gate'"'"'s output is below; all of it is in {{gate_log}}.
+Find the cause, fix it, commit, and stop. Run the gate again to check: {{gate}}
+Do not merge, push, or edit the plan file.
+
+{{gate_tail}}'
+
+# render <template text>: fills {{name}} from DANGLE_T_name.
+render() {
+  printf '%s\n' "$1" | awk '{
+    line = $0; out = ""
+    while ((i = index(line, "{{")) > 0) {
+      j = index(substr(line, i + 2), "}}"); if (!j) break
+      name = substr(line, i + 2, j - 1); key = "DANGLE_T_" name
+      out = out substr(line, 1, i - 1) ((key in ENVIRON) ? ENVIRON[key] : "{{" name "}}")
+      line = substr(line, i + j + 3)
+    }
+    print out line }'
+}
+template() { if [ -f "$DOT/$1" ]; then cat "$DOT/$1"; else printf '%s' "$2"; fi; }
+
+gate_desc() {
+  if has_hook gate; then printf '.dangle/hooks/gate'; else printf '(no gate: .dangle/hooks/gate is missing)'; fi
+}
+
+# run_agent <spec> <worktree> <log> <prompt>
+run_agent() {
+  local spec="$1" dir="$2" log="$3" prompt="$4" tailer='' rc
+  resolve_agent "$spec" "$(cfg AGENT)"
+  say "  agent  $AGENT_LABEL  (log $log)"
+  printf '\n=== %s  %s ===\n' "$(date)" "$AGENT_LABEL" >> "$log"
+  if [ "${FOLLOW:-0}" = 1 ]; then tail -n 0 -f "$log" & tailer=$!; fi
+  (
+    cd "$dir" || exit 1
+    set -f; set -- $AGENT_CMD; set +f
+    DANGLE=1 DANGLE_MODEL=${AGENT_LABEL#*:}; export DANGLE DANGLE_MODEL
+    run_limited "$AGENT_SECS" "$@" "$prompt" < /dev/null >> "$log" 2>&1
+  )
+  rc=$?
+  [ -n "$tailer" ] && kill "$tailer" 2>/dev/null
+  [ $rc = 124 ] && say "  agent  stopped after $(cfg AGENT_TIMEOUT 4h)"
+  return $rc
+}
+
+# commit_leftovers <worktree>: an agent that forgot to commit still gets its work gated.
+commit_leftovers() {
+  [ -n "$(git -C "$1" status --porcelain)" ] || return 0
+  git -C "$1" add -A && git -C "$1" commit -q -m "dangle: work the agent left uncommitted"
+}
+
+# ---------------------------------------------------------------- the gate
+
+# run_gate <worktree> <log> [plan file]: the gate hook, then the plan's `Done when:` command.
+run_gate() {
+  local dir="$1" log="$2" plan="${3-}" dw rc
+  printf '=== gate %s ===\n' "$(date)" > "$log"
+  if has_hook gate; then
+    run_limited "$GATE_SECS" sh -c 'cd "$1" && DANGLE_HOOK=gate exec "$2"' sh "$dir" "$HOOKS/gate" >> "$log" 2>&1
+    rc=$?
+    [ $rc = 124 ] && echo "dangle: the gate ran longer than $(cfg GATE_TIMEOUT 60m)" >> "$log"
+    [ $rc = 0 ] || return 1
+  else
+    echo "dangle: no .dangle/hooks/gate; nothing checked" >> "$log"
+  fi
+  if [ -n "$plan" ]; then
+    dw=$(plan_done_when "$plan")
+    if [ -n "$dw" ]; then
+      printf '=== done when: %s ===\n' "$dw" >> "$log"
+      ( cd "$dir" && sh -c "$dw" ) >> "$log" 2>&1 || return 1
+    fi
+  fi
+}
+
+regate_needed() { # <old base> <new base>
+  has_hook regate || return 0
+  hook regate "$DANGLE_WORKTREE" "$1" "$2"
+}
+
+# ---------------------------------------------------------------- landing
+
+FAIL_REASON=
+fail() { FAIL_REASON=$1; return 1; }
+
+# merge_base_in <worktree> <interactive>: merges the base branch into the worktree's branch.
+merge_base_in() {
+  git -C "$1" merge -q --no-edit "refs/heads/$BASE" >/dev/null 2>&1 && return 0
+  if [ "${2-}" = 1 ]; then
+    err "the merge of $BASE into $1 conflicts: resolve it there, commit, and run dangle land again"
+  else
+    git -C "$1" merge --abort 2>/dev/null
+  fi
+  return 1
+}
+
+# land <branch> <plan file or empty> <fix spec or empty> <interactive> [keep]
+land() {
+  local branch="$1" plan="$2" fix="$3" inter="$4" keep="${5-}" path id log fixes=0 tries=0 old new tree sha msg
+  path=$(wt_path "$branch")
+  [ -d "$path" ] || fail "no worktree at $path" || return 1
+  [ -z "$(git -C "$path" status --porcelain --untracked-files=no)" ] ||
+    fail "$path has uncommitted changes" || return 1
+  id=${plan:+$(plan_id "$plan")}
+  log="$STATE/logs/${id:-$branch}.gate.log"
+  export_ctx "$path" "$branch"
+
+  sync_base
+  merge_base_in "$path" "$inter" || fail "conflicts with $BASE" || return 1
+
+  # The plan moves to the done folder in the branch itself, so it lands with the work.
+  if [ -n "$plan" ] && [ -f "$path/$PLANS/${plan##*/}" ]; then
+    mkdir -p "$path/$PLANS/$DONE"
+    git -C "$path" mv "$PLANS/${plan##*/}" "$PLANS/$DONE/${plan##*/}" &&
+      git -C "$path" commit -q -m "dangle: plan $id done" || fail "could not move the plan to $DONE/" || return 1
+  fi
+
+  say "  gate   running (log $log)"
+  while ! run_gate "$path" "$log" "${plan:+$path/$PLANS/$DONE/${plan##*/}}"; do
+    if [ -z "$fix" ] || [ $fixes -ge "$FIXES" ]; then
+      fail "the gate failed (log $log)"; return 1
+    fi
+    fixes=$((fixes + 1))
+    say "  gate   failed; fix-up $fixes of $FIXES"
+    DANGLE_T_gate_log=$log DANGLE_T_gate_tail=$(tail -n 80 "$log")
+    export DANGLE_T_gate_log DANGLE_T_gate_tail
+    run_agent "$fix" "$path" "$STATE/logs/${id:-$branch}.log" "$(render "$(template fix-prompt.md "$DEFAULT_FIX_PROMPT")")"
+    commit_leftovers "$path"
+    sync_base
+    merge_base_in "$path" "$inter" || fail "conflicts with $BASE" || return 1
+  done
+
+  take_lock "$STATE/land.lock" "another landing"
+  while :; do
+    tries=$((tries + 1))
+    [ $tries -le 3 ] || { drop_lock "$STATE/land.lock"; fail "$BASE kept moving; try again"; return 1; }
+    sync_base
+    new=$(git rev-parse "refs/heads/$BASE")
+    if ! git merge-base --is-ancestor "$new" "$(git -C "$path" rev-parse HEAD)"; then
+      old=$(git merge-base "$new" "$(git -C "$path" rev-parse HEAD)")
+      merge_base_in "$path" "$inter" || { drop_lock "$STATE/land.lock"; fail "conflicts with $BASE"; return 1; }
+      if regate_needed "$old" "$new"; then
+        say "  gate   $BASE moved; gating again"
+        run_gate "$path" "$log" "${plan:+$path/$PLANS/$DONE/${plan##*/}}" ||
+          { drop_lock "$STATE/land.lock"; fail "the gate failed after $BASE moved (log $log)"; return 1; }
+      fi
+    fi
+    tree=$(git -C "$path" rev-parse 'HEAD^{tree}')
+    if [ "$tree" = "$(git rev-parse "$new^{tree}")" ]; then
+      drop_lock "$STATE/land.lock"; fail "nothing to land: the branch has no changes"; return 1
+    fi
+    if [ -n "$plan" ]; then msg="$(plan_title "$path/$PLANS/$DONE/${plan##*/}")"; else msg=$branch; fi
+    [ -n "$msg" ] || msg=$branch
+    {
+      printf '%s\n\nLanded by dangle from %s.\n\n' "$msg" "$branch"
+      git -C "$path" log --no-merges --format='- %s' "$new..HEAD" | grep -v '^- dangle: '
+    } > "$STATE/message"
+    if has_hook land; then
+      # The project lands it its own way (a pull request and CI, a merge commit, a queue).
+      say "  land   .dangle/hooks/land"
+      DANGLE_TITLE=$msg DANGLE_MESSAGE_FILE="$STATE/message" DANGLE_REMOTE=$REMOTE
+      export DANGLE_TITLE DANGLE_MESSAGE_FILE DANGLE_REMOTE
+      if ! hook land "$path" >> "$log" 2>&1; then
+        drop_lock "$STATE/land.lock"; fail "the land hook failed (log $log)"; return 1
+      fi
+      drop_lock "$STATE/land.lock"
+      sync_base
+      if [ -n "$plan" ] && ! is_landed "$id"; then
+        # Handed off (a pull request still waiting for CI): skipped by later runs until it lands.
+        mkdir -p "$STATE/submitted"; date '+%F %T' > "$STATE/submitted/$id"
+        say "  land   submitted; not on $BASE yet"
+        LAND_RESULT=submitted
+      fi
+      [ -n "$keep" ] || [ "${LAND_RESULT-}" = submitted ] || remove_worktree "$branch" force ||
+        err "landed, but the worktree $path was not removed"
+      return 0
+    fi
+    sha=$(git commit-tree "$tree" -p "$new" < "$STATE/message") ||
+      { drop_lock "$STATE/land.lock"; fail "could not squash"; return 1; }
+    if [ -n "$REMOTE" ] && ! git push -q "$REMOTE" "$sha:refs/heads/$BASE" 2>/dev/null; then
+      say "  land   $REMOTE/$BASE moved during the landing; syncing again"
+      continue
+    fi
+    advance_base "$sha" "$new"
+    break
+  done
+  drop_lock "$STATE/land.lock"
+  say "  land   $(git rev-parse --short "$sha") on $BASE${REMOTE:+ (pushed to $REMOTE)}"
+  if [ -z "$keep" ]; then
+    remove_worktree "$branch" force || err "landed, but the worktree $path was not removed"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- commands
+
+usage() {
+  cat <<'EOF'
+dangle: a carrot on a stick for your coding agent.
+
+  dangle [ids...] [options]     run the active plans in order (or only these ids)
+  dangle status                 every active plan: ready, waiting, running, failed
+  dangle lint                   check the active plans (size, ids, dependencies)
+  dangle doctor [--agent]       check the setup (--agent also asks the agent to reply)
+  dangle init                   create .dangle/ for this repository
+  dangle skill [--print]        install the plan-writing skill for your agents
+
+  dangle new <branch> [--base B]   a worktree with .dangle/copy and the setup hook
+  dangle land [branch|id] [--fix] [--keep]   gate, squash and land a worktree
+  dangle rm <branch> [-f]       the teardown hook, then remove a worktree and its branch
+  dangle list                   worktrees with ahead/behind and changes
+  dangle path <branch|id>       print a worktree's path:  cd "$(dangle path 865)"
+
+Run options:
+  -a, --agent SPEC      agent for this run: claude:haiku, pi:qwen3.8:latest, opencode,
+                        an ALIAS_ from .dangle/config, or a bare model for the default
+      --fix-agent SPEC  agent for fix-ups after a failed gate (default: the agent)
+      --rest            after the ids given, run every other active plan too
+      --fresh           start a plan's worktree over instead of continuing a kept one
+      --follow          show the agent's output as it runs
+  -n, --dry-run         print what would run and stop
+  -y, --yes             do not ask before starting
+  -q, --quiet           no art
+
+Environment: DANGLE_AGENT, DANGLE_FIX_AGENT, DANGLE_REMOTE (none = do not fetch or push).
+Configuration: .dangle/config, .dangle/copy, .dangle/hooks/*, .dangle/prompt.md (see README).
+EOF
+}
+
+cmd_run() {
+  local ids='' rest=0 dry=0 yes=0 agent='' fixagent='' f id queue='' total=0 n=0 landed=0 failed=0 skipped=0 \
+    t0 t1 tstart spec path branch result fast=0 deps summary line
+  FRESH=0 FOLLOW=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -a|--agent) agent=${2-}; shift ;;
+      --agent=*) agent=${1#*=} ;;
+      --fix-agent) fixagent=${2-}; shift ;;
+      --fix-agent=*) fixagent=${1#*=} ;;
+      --rest) rest=1 ;;
+      --fresh) FRESH=1 ;;
+      --follow) FOLLOW=1 ;;
+      -n|--dry-run) dry=1 ;;
+      -y|--yes) yes=1 ;;
+      -q|--quiet) QUIET=1 ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "unknown option $1 (dangle --help)" ;;
+      *) ids="$ids $(printf '%s' "$1" | tr ',' ' ')" ;;
+    esac
+    shift
+  done
+  agent=${agent:-${DANGLE_AGENT:-}}
+  fixagent=${fixagent:-${DANGLE_FIX_AGENT:-$(cfg FIX_AGENT)}}
+  [ -n "$(cfg AGENT)$agent" ] || die "no agent: set AGENT= in .dangle/config (dangle init) or pass -a"
+  [ -d "$PRIMARY/$PLANS" ] || die "no plans folder $PLANS (set PLANS= in .dangle/config)"
+  if [ -n "$(git -C "$PRIMARY" status --porcelain --untracked-files=all -- "$PLANS")" ] && [ $dry = 0 ]; then
+    err "the plans folder has changes that are not committed; a worktree only sees committed plans:"
+    git -C "$PRIMARY" status --short -- "$PLANS" >&2
+    exit 1
+  fi
+  [ $dry = 1 ] || require_clean_base
+
+  # The queue: the ids given, in that order (then the rest with --rest), or every active plan.
+  for id in $ids; do
+    f=$(find_plan "$id") || die "no active plan '$id' in $PLANS"
+    queue="$queue
+$f"
+  done
+  if [ -z "$ids" ] || [ $rest = 1 ]; then
+    for f in $(plan_files); do
+      case "$queue
+" in *"
+$f
+"*) continue ;; esac
+      queue="$queue
+$f"
+    done
+  fi
+  queue=$(printf '%s\n' "$queue" | sed '/^$/d')
+  [ -n "$queue" ] || { say "dangle: no active plans in $PLANS"; return 0; }
+  total=$(printf '%s\n' "$queue" | wc -l | tr -d ' ')
+
+  if [ $dry = 1 ]; then
+    say "dangle would run $total plan(s) from $PLANS onto $BASE:"
+    for f in $queue; do
+      deps=$(unmet "$f" | tr '\n' ' ')
+      printf '  %-8s %s%s\n' "$(plan_id "$f")" "$(plan_title "$f")" "${deps:+   (waits for $deps)}"
+    done
+    return 0
+  fi
+
+  resolve_agent "${agent:-$(cfg AGENT)}" "$(cfg AGENT)"
+  if [ $yes = 0 ] && [ -t 0 ] && [ -t 1 ]; then
+    printf 'Run %s plan(s) with %s onto %s? [Y/n] ' "$total" "$AGENT_LABEL" "$BASE"
+    read -r line || line=n
+    case $line in ''|y|Y|yes) ;; *) return 0 ;; esac
+  fi
+
+  # Keep the computer awake for the night (Linux re-runs dangle under systemd-inhibit in main).
+  if [ -z "${DANGLE_AWAKE:-}" ] && command -v caffeinate >/dev/null 2>&1; then
+    caffeinate -i -w $$ &
+  fi
+
+  trap 'cleanup; exit 130' INT TERM
+  trap cleanup EXIT
+  summary="$STATE/last-run.md"
+  printf '# dangle run %s\n\nagent %s, base %s\n\n' "$(date)" "$AGENT_LABEL" "$BASE" > "$summary"
+  art_stick
+  say "  dangle · $total plan(s) · agent $AGENT_LABEL · base $BASE"
+  sync_base
+  tstart=$(date +%s)
+
+  for f in $queue; do
+    n=$((n + 1)); id=$(plan_id "$f"); branch="$PREFIX$id"; path=$(wt_path "$branch")
+    say ""
+    say "  $id  $(plan_title "$f")"
+    t0=$(date +%s); result=
+    deps=$(unmet "$f" | tr '\n' ' ')
+    if [ ! -f "$f" ]; then
+      result="skipped  (landed by another run)"
+    elif [ -n "$deps" ]; then
+      result="skipped  (waits for ${deps% })"
+    elif ! git cat-file -e "refs/heads/$BASE:$PLANS/${f##*/}" 2>/dev/null; then
+      result="skipped  (not committed on $BASE)"
+    elif [ -f "$STATE/submitted/$id" ] && [ -z "$ids" ]; then
+      result="skipped  (submitted $(cat "$STATE/submitted/$id"); waiting for it to land)"
+    elif ! claim "$id"; then
+      result="skipped  (another dangle is running it)"
+    fi
+    if [ -n "$result" ]; then
+      skipped=$((skipped + 1))
+    else
+      FAIL_REASON=
+      if [ -d "$path" ] && [ $FRESH = 0 ]; then
+        say "  worktree  continuing $path"
+      else
+        [ -d "$path" ] && remove_worktree "$branch" force
+        git show-ref -q --verify "refs/heads/$branch" && [ $FRESH = 1 ] && git branch -q -D "$branch"
+        new_worktree "$branch" || FAIL_REASON="could not create the worktree"
+      fi
+      spec=${agent:-$(plan_field "$f" agent)}
+      spec=${spec:-$(cfg AGENT)}
+      if [ -z "$FAIL_REASON" ]; then
+        export_ctx "$path" "$branch"
+        DANGLE_PLAN=$id DANGLE_PLAN_FILE="$PLANS/${f##*/}"; export DANGLE_PLAN DANGLE_PLAN_FILE
+        DANGLE_T_plan="$PLANS/${f##*/}" DANGLE_T_id=$id DANGLE_T_branch=$branch DANGLE_T_base=$BASE \
+          DANGLE_T_title=$(plan_title "$f") DANGLE_T_gate=$(gate_desc)
+        export DANGLE_T_plan DANGLE_T_id DANGLE_T_branch DANGLE_T_base DANGLE_T_title DANGLE_T_gate
+        t1=$(date +%s)
+        run_agent "$spec" "$path" "$STATE/logs/$id.log" "$(render "$(template prompt.md "$DEFAULT_PROMPT")")"
+        t1=$(( $(date +%s) - t1 ))
+        commit_leftovers "$path"
+        if [ "$(git rev-list --count "refs/heads/$BASE..$branch")" = 0 ]; then
+          FAIL_REASON="the agent made no commits (log $STATE/logs/$id.log)"
+        else
+          LAND_RESULT=
+          if land "$branch" "$f" "${fixagent:-$spec}" 0; then
+            result=${LAND_RESULT:-landed}
+          fi
+        fi
+      fi
+      if [ "$result" = landed ] || [ "$result" = submitted ]; then
+        landed=$((landed + 1)); fast=0
+      else
+        failed=$((failed + 1))
+        result="FAILED   $FAIL_REASON; kept $path"
+        if [ "${t1:-999}" -lt 60 ]; then fast=$((fast + 1)); else fast=0; fi
+      fi
+      unclaim "$id"
+    fi
+    printf '%s %s\n' "$(date '+%F %T')" "$result" > "$STATE/results/$id"
+    printf -- '- %s %s (%s): %s\n' "$id" "$result" "$(minutes "$t0" "$(date +%s)")" "$(plan_title "$f" 2>/dev/null)" >> "$summary"
+    say "  $(progress_bar $n "$total")  $n/$total  $id $result  $(minutes "$t0" "$(date +%s)")"
+    if [ $fast -ge 2 ]; then
+      say ""
+      say "  stopping: the agent failed fast twice in a row (out of credit or usage? signed out? model down?)"
+      printf '\nStopped early: the agent failed fast twice in a row.\n' >> "$summary"
+      break
+    fi
+  done
+
+  printf '\n%s landed, %s failed, %s skipped, %s\n' "$landed" "$failed" "$skipped" "$(minutes "$tstart" "$(date +%s)")" >> "$summary"
+  if [ $landed -gt 0 ]; then art_carrot; else fancy && art_stick && say "  no carrot tonight"; fi
+  say ""
+  say "  $landed landed · $failed failed · $skipped skipped · $(minutes "$tstart" "$(date +%s)")"
+  say "  summary: $summary"
+  [ -x "$HOOKS/done" ] && hook "done" "$PRIMARY" "$summary"
+  [ $failed = 0 ]
+}
+
+cmd_status() {
+  local f id state pid r deps
+  printf '%-8s %-10s %s\n' ID STATE PLAN
+  for f in $(plan_files); do
+    id=$(plan_id "$f")
+    pid=$(cat "$STATE/claims/$id/pid" 2>/dev/null || true)
+    deps=$(unmet "$f" | tr '\n' ' ')
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then state="running"
+    elif [ -f "$STATE/submitted/$id" ]; then state="submitted"
+    elif [ -n "$deps" ]; then state="waiting"
+    elif [ -d "$(wt_path "$PREFIX$id")" ]; then state="kept"
+    else state="ready"; fi
+    printf '%-8s %-10s %s\n' "$id" "$state" "$(plan_title "$f")"
+    [ -n "$deps" ] && printf '%-19s waits for %s\n' '' "${deps% }"
+    r=$(cat "$STATE/results/$id" 2>/dev/null || true)
+    case $r in *FAILED*) printf '%-19s last: %s\n' '' "$r" ;; esac
+  done
+  [ -f "$STATE/last-run.md" ] && say "" && say "last run: $STATE/last-run.md"
+}
+
+cmd_lint() {
+  local f id lines ids='' errors=0 warnings=0 d all
+  all=$( { for f in $(plan_files); do plan_id "$f"; done; landed_ids; } | sort -u)
+  for f in $(plan_files); do
+    id=$(plan_id "$f")
+    case " $ids " in *" $id "*) err "${f##*/}: id $id is used by another plan"; errors=$((errors + 1)) ;; esac
+    ids="$ids $id"
+    lines=$(wc -l < "$f" | tr -d ' ')
+    [ "$lines" -le "$MAX_LINES" ] || { say "warning: ${f##*/}: $lines lines (MAX_LINES=$MAX_LINES); split it?"; warnings=$((warnings + 1)); }
+    [ -n "$(plan_title "$f")" ] || { say "warning: ${f##*/}: no '# title' line"; warnings=$((warnings + 1)); }
+    for d in $(plan_field "$f" depends | tr ',' ' '); do
+      printf '%s\n' "$all" | grep -Fqx "$d" || { err "${f##*/}: depends on $d, which is neither active nor landed"; errors=$((errors + 1)); }
+    done
+  done
+  say "lint: $(plan_files | wc -l | tr -d ' ') active plan(s), $errors error(s), $warnings warning(s)"
+  [ $errors = 0 ]
+}
+
+cmd_doctor() {
+  local probe=0 bad=0 w out
+  [ "${1-}" = --agent ] && probe=1
+  ok() { printf '  ok    %s\n' "$*"; }
+  no() { printf '  FAIL  %s\n' "$*"; bad=1; }
+  warn() { printf '  note  %s\n' "$*"; }
+  say "dangle $VERSION in $PRIMARY"
+  git show-ref -q --verify "refs/heads/$BASE" && ok "base branch $BASE" || no "base branch '$BASE' does not exist (BASE= in .dangle/config)"
+  [ -d "$PRIMARY/$PLANS" ] && ok "plans in $PLANS ($(plan_files | wc -l | tr -d ' ') active)" || no "no plans folder $PLANS (PLANS=)"
+  [ -f "$DOT/config" ] && ok ".dangle/config" || warn "no .dangle/config: run dangle init"
+  if has_hook gate; then ok "gate hook"; else no "no executable .dangle/hooks/gate: nothing would check the work"; fi
+  for w in setup teardown regate "done"; do
+    if [ -e "$HOOKS/$w" ] && [ ! -x "$HOOKS/$w" ]; then no ".dangle/hooks/$w is not executable (chmod +x)"; fi
+  done
+  if [ -n "$(cfg AGENT)" ]; then
+    resolve_agent "$(cfg AGENT)" ""
+    command -v "${AGENT_CMD%% *}" >/dev/null 2>&1 && ok "agent $AGENT_LABEL (${AGENT_CMD%% *})" || no "agent command '${AGENT_CMD%% *}' not found"
+  else
+    no "no AGENT= in .dangle/config"
+  fi
+  if [ -n "$(cfg FIX_AGENT)" ]; then
+    resolve_agent "$(cfg FIX_AGENT)" "$(cfg AGENT)"
+    command -v "${AGENT_CMD%% *}" >/dev/null 2>&1 && ok "fix agent $AGENT_LABEL" || no "fix agent command '${AGENT_CMD%% *}' not found"
+  fi
+  [ -n "$REMOTE" ] && ok "remote $REMOTE (fetched before and pushed after each landing)" || warn "no remote: landings stay local"
+  [ -n "$TIMEOUT_BIN" ] && ok "time limits ($TIMEOUT_BIN)" || warn "no timeout command (coreutils); a hung agent's own children may outlive its time limit"
+  command -v systemd-inhibit >/dev/null 2>&1 || command -v caffeinate >/dev/null 2>&1 || warn "nothing to keep the computer awake (systemd-inhibit or caffeinate)"
+  if [ $probe = 1 ] && [ -n "$(cfg AGENT)" ]; then
+    resolve_agent "$(cfg AGENT)" ""
+    say "  ...   asking $AGENT_LABEL to reply (up to 3 minutes)"
+    out=$(cd "$PRIMARY" && set -f && set -- $AGENT_CMD && set +f && DANGLE=1 run_limited 180 "$@" "Reply with the single word OK and do nothing else." < /dev/null 2>&1)
+    case $out in *OK*) ok "the agent replied" ;; *) no "the agent did not reply OK:"; printf '%s\n' "$out" | tail -n 15 | sed 's/^/        /' ;; esac
+  fi
+  return $bad
+}
+
+# ---------------------------------------------------------------- init
+
+write_new() { # <path> <mode>; content on stdin
+  if [ -e "$1" ]; then say "  kept     ${1#"$PRIMARY"/} (exists)"; cat > /dev/null; return; fi
+  cat > "$1"; [ "${2-}" = x ] && chmod +x "$1"
+  say "  created  ${1#"$PRIMARY"/}"
+}
+
+cmd_init() {
+  local gate='echo "dangle: write your checks in .dangle/hooks/gate" >&2; exit 1' setup='' copy='' agent=claude
+  cd "$PRIMARY" || exit 1
+  if [ -f Cargo.toml ]; then gate='cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace'; copy="$copy
+# A warm build directory (copy-on-write on btrfs, xfs and APFS; a full copy elsewhere).
+# target"
+  elif [ -f package.json ]; then
+    local pm=npm
+    [ -f pnpm-lock.yaml ] && pm=pnpm; [ -f yarn.lock ] && pm=yarn; [ -f bun.lockb ] || [ -f bun.lock ] && pm=bun
+    gate="$pm test"
+    copy="$copy
+node_modules"
+    setup="# Bring the copied node_modules up to date with this branch's lockfile.
+$pm install"
+  elif [ -f go.mod ]; then gate='go vet ./...
+go test ./...'
+  elif [ -f pyproject.toml ] || [ -f requirements.txt ]; then gate='pytest'; copy="$copy
+.venv"
+  elif [ -f Gemfile ]; then
+    if [ -x bin/rails ]; then gate='bin/rails test'; else gate='bundle exec rake'; fi
+  elif [ -f Makefile ] && grep -q '^test:' Makefile; then gate='make test'
+  fi
+  [ -f .env ] && copy=".env$copy"
+  for a in pi opencode claude codex; do command -v $a >/dev/null 2>&1 && { agent=$a; break; }; done
+  mkdir -p .dangle/hooks
+  write_new .dangle/config <<EOF
+# dangle settings: KEY=value, one per line. Read, never run.
+BASE=$BASE
+PLANS=$PLANS
+# Landed plans move here, inside PLANS.
+DONE=done
+# The agent: pi, opencode, claude or codex, with an optional :model (claude:haiku,
+# pi:ollama-local/qwen3.8:latest), or a command of your own that takes the prompt last.
+AGENT=$agent
+# FIX_AGENT=claude:sonnet
+# Fix-up runs after a failed gate (0 = none).
+FIXES=1
+AGENT_TIMEOUT=4h
+GATE_TIMEOUT=60m
+# Short names for -a:  dangle -a cheap
+# ALIAS_cheap=claude:haiku
+# REMOTE=origin   (none = never fetch or push)
+# WORKTREES=.worktrees
+# BRANCH_PREFIX=plan-
+# MAX_LINES=300
+EOF
+  write_new .dangle/copy <<EOF
+# Paths copied from the main checkout into every new worktree (before the setup hook).
+# Copies are copy-on-write where the disk allows. 'link <path>' makes a symlink instead.
+# Use this for files git does not track: .env, node_modules, a warm build directory.$copy
+EOF
+  write_new .dangle/hooks/setup x <<EOF
+#!/bin/sh
+# Runs in a new worktree, after .dangle/copy. A failure stops the plan.
+# \$DANGLE_PRIMARY is the main checkout, \$DANGLE_WORKTREE this worktree, \$DANGLE_BRANCH its branch.
+set -e
+$setup
+EOF
+  write_new .dangle/hooks/gate x <<EOF
+#!/bin/sh
+# The gate: runs in the worktree before a landing. Exit 0 and the work lands; anything
+# else and it does not. Make it the checks you trust: format, lint, tests, build.
+set -e
+$gate
+EOF
+  write_new .dangle/hooks/teardown x <<'EOF'
+#!/bin/sh
+# Runs in a worktree just before it is removed (after a landing or `dangle rm`).
+# Save anything worth keeping, e.g. a build cache for the next worktree.
+EOF
+  ensure_excluded
+  say ""
+  say "Next: read .dangle/hooks/gate, then dangle doctor --agent, then dangle --dry-run."
+  say "Optional: .dangle/hooks/regate <old> <new> (exit 1 = no second gate when $BASE moved),"
+  say ".dangle/hooks/done <summary file> (after a run), .dangle/prompt.md and fix-prompt.md."
+}
+
+# ---------------------------------------------------------------- skill
+
+skill_text() {
+  cat <<'EOF'
+---
+name: dangle-plans
+description: >
+  Use when writing implementation plans for dangle (the overnight plan runner), or when
+  preparing a repository's existing plans for it: numbering them in run order, splitting
+  large ones, marking dependencies, and retiring plans that are already done.
+---
+
+# Plans for dangle
+
+dangle runs every `*.md` file directly in the plans folder (`PLANS=` in `.dangle/config`;
+`dangle doctor` prints it), one at a time, in filename order. Each plan gets a fresh
+worktree from the base branch, an agent implements it, the gate checks it, and only then
+does it land. Subfolders are inactive: `done/` holds landed plans, and any other subfolder
+(`hold/`, `drafts/`) parks a plan.
+
+## Writing a plan
+
+- **File name:** `NNN-short-name.md`, or with a date `YYYY-MM-DD-NNN-short-name.md`. The number
+  is the id (`dangle 865`), and the order of the names is the run order. Use the next free
+  number; leave gaps when you might insert plans later.
+- **One goal.** A plan is one change a single agent session can finish: about 3 to 8 files.
+  Two goals make two plans. Aim for 100 to 300 lines (`MAX_LINES`, warned by `dangle lint`).
+- **Header** (optional), on one line under the title:
+  `<!-- dangle: depends=863,864 agent=claude:sonnet -->`. `depends` makes dangle skip the plan
+  until those plans landed; `agent` picks the agent for a hard plan (a command-line `-a` wins).
+- **Write for the agent that runs it, not for you.** It starts cold: name the files, the
+  functions, the commands and the tests. Say what "done" is.
+- **`Done when:`** a line such as ``Done when: `cargo test payroll` `` gives a command dangle runs
+  after the gate; the plan only lands when it passes.
+- **No landing steps.** Never tell the agent to merge, push, rebase, switch branches, or move
+  the plan: dangle does that.
+- **Split rather than grow.** If a plan passes ~300 lines, or needs "and also", split it and
+  chain the parts with `depends=`.
+- The plan must be **committed on the base branch** before a run: a worktree only sees
+  committed files.
+
+## Preparing an existing repository
+
+1. Run `dangle init` if `.dangle/` is missing, and check `.dangle/hooks/gate` really checks.
+2. List the plans folder. For each plan, decide from the code and `git log` whether it is
+   already done; move done ones to `done/` with `git mv`.
+3. Park plans that need a human decision in `hold/`.
+4. Put the rest in dependency order, and rename them `NNN-name.md` (keep a leading date if
+   the repository uses one), with gaps of 10 so later plans fit between.
+5. Split any plan over ~300 lines or with more than one goal; add `depends=` lines.
+6. Run `dangle lint` and `dangle --dry-run`; commit the plans.
+
+## Running
+
+- `dangle` runs everything; `dangle 865 870` runs only those; `dangle 865 --rest` runs 865 first,
+  then the rest. `-a claude:haiku` picks the agent for this run.
+- `dangle status` shows what is ready, waiting, running or failed. A failed plan keeps its
+  worktree: `dangle 866` continues it, `--fresh` starts it over, `dangle land 866` lands it
+  after you fixed it by hand.
+EOF
+}
+
+cmd_skill() {
+  local d
+  if [ "${1-}" = --print ]; then skill_text; return; fi
+  d="$PRIMARY/.claude/skills/dangle-plans"
+  [ -d "$PRIMARY/.agents/skills" ] && d="$PRIMARY/.agents/skills/dangle-plans"
+  mkdir -p "$d"
+  skill_text > "$d/SKILL.md"
+  say "wrote ${d#"$PRIMARY"/}/SKILL.md"
+}
+
+# ---------------------------------------------------------------- worktree commands
+
+# branch_of <branch, id, or nothing for the current worktree>
+branch_of() {
+  local a="${1-}" f
+  if [ -z "$a" ]; then
+    a=$(git symbolic-ref -q --short HEAD) || die "not on a branch"
+    [ "$a" != "$BASE" ] || die "this is $BASE; name the worktree to land"
+    printf '%s' "$a"; return
+  fi
+  if git show-ref -q --verify "refs/heads/$a"; then printf '%s' "$a"; return; fi
+  if git show-ref -q --verify "refs/heads/$PREFIX$a"; then printf '%s' "$PREFIX$a"; return; fi
+  f=$(find_plan "$a" 2>/dev/null) && git show-ref -q --verify "refs/heads/$PREFIX$(plan_id "$f")" &&
+    { printf '%s' "$PREFIX$(plan_id "$f")"; return; }
+  die "no branch '$a'"
+}
+
+cmd_new() {
+  local branch='' from=''
+  while [ $# -gt 0 ]; do
+    case $1 in --base) from=${2-}; shift ;; -*) die "unknown option $1" ;; *) branch=$1 ;; esac
+    shift
+  done
+  [ -n "$branch" ] || die "usage: dangle new <branch> [--base <branch>]"
+  new_worktree "$branch" "${from:-$BASE}" || exit 1
+  wt_path "$branch"; echo
+}
+
+cmd_land() {
+  local name='' fix='' keep='' branch plan='' f spec
+  [ -z "${DANGLE:-}" ] || die "refused: an agent run by dangle never lands; dangle lands this branch after you finish"
+  while [ $# -gt 0 ]; do
+    case $1 in --fix) fix=1 ;; --keep) keep=1 ;; -*) die "unknown option $1" ;; *) name=$1 ;; esac
+    shift
+  done
+  branch=$(branch_of "$name")
+  case $branch in "$PREFIX"*)
+    f=$(find_plan "${branch#"$PREFIX"}" 2>/dev/null) && [ "$(plan_id "$f")" = "${branch#"$PREFIX"}" ] && plan=$f ;;
+  esac
+  require_clean_base
+  if [ -n "$fix" ]; then
+    spec=$(cfg FIX_AGENT "$(cfg AGENT)")
+    [ -n "$spec" ] || die "--fix needs an AGENT in .dangle/config"
+    DANGLE_T_plan=${plan:+$PLANS/${plan##*/}} DANGLE_T_branch=$branch DANGLE_T_gate=$(gate_desc)
+    export DANGLE_T_plan DANGLE_T_branch DANGLE_T_gate
+  fi
+  trap 'cleanup; exit 130' INT TERM
+  trap cleanup EXIT
+  say "dangle: landing $branch onto $BASE"
+  [ -n "$plan" ] && claim "$(plan_id "$plan")" || true
+  if land "$branch" "$plan" "${fix:+$spec}" 1 "$keep"; then
+    [ -n "$plan" ] && unclaim "$(plan_id "$plan")"
+    art_carrot
+    return 0
+  fi
+  err "$FAIL_REASON"
+  exit 1
+}
+
+cmd_rm() {
+  local name='' force=''
+  while [ $# -gt 0 ]; do
+    case $1 in -f|--force) force=1 ;; -*) die "unknown option $1" ;; *) name=$1 ;; esac
+    shift
+  done
+  [ -n "$name" ] || die "usage: dangle rm <branch> [-f]"
+  remove_worktree "$(branch_of "$name")" "$force" || die "not removed (uncommitted changes or an unmerged branch? -f forces)"
+}
+
+cmd_list() {
+  git worktree list --porcelain | awk '/^worktree /{w=substr($0,10)} /^branch /{print w "\t" substr($0,19)}' |
+  while IFS="$(printf '\t')" read -r w b; do
+    case $w in "$PRIMARY/$WORKTREES"/*) ;; *) continue ;; esac
+    printf '%-40s +%s -%s%s\n' "$b" \
+      "$(git rev-list --count "refs/heads/$BASE..refs/heads/$b")" \
+      "$(git rev-list --count "refs/heads/$b..refs/heads/$BASE")" \
+      "$( [ -n "$(git -C "$w" status --porcelain)" ] && echo '  (changes)')"
+  done
+}
+
+cmd_path() {
+  [ -n "${1-}" ] || die "usage: dangle path <branch|id>"
+  wt_path "$(branch_of "$1")"; echo
+}
+
+# ---------------------------------------------------------------- main
+
+main() {
+  case ${1-} in
+    -h|--help|help) usage; return 0 ;;
+    -V|--version|version) say "dangle $VERSION"; return 0 ;;
+  esac
+  [ "${1-} ${2-}" = "skill --print" ] && { skill_text; return 0; }
+  find_repo
+  settings
+  case ${1-} in
+    status|lint|doctor|init|skill|new|land|rm|list|path) ;;
+    *)
+      # A run keeps the computer awake for the night.
+      if [ -z "${DANGLE_AWAKE:-}" ] && command -v systemd-inhibit >/dev/null 2>&1 &&
+        systemd-inhibit --what=sleep:idle --who=dangle --why=check true 2>/dev/null; then
+        DANGLE_AWAKE=1 exec systemd-inhibit --what=sleep:idle --who=dangle --why="running plans" "$0" "$@"
+      fi ;;
+  esac
+  case ${1-} in
+    run) shift; cmd_run "$@" ;;
+    status) cmd_status ;;
+    lint) cmd_lint ;;
+    doctor) shift; cmd_doctor "$@" ;;
+    init) cmd_init ;;
+    skill) shift; cmd_skill "$@" ;;
+    new) shift; cmd_new "$@" ;;
+    land) shift; cmd_land "$@" ;;
+    rm) shift; cmd_rm "$@" ;;
+    list) cmd_list ;;
+    path) shift; cmd_path "$@" ;;
+    *) cmd_run "$@" ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,29 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -s sh -S warning -e SC3043 bin/dangle install.sh examples/land/* examples/regate-docs-only
+        if: runner.os == 'Linux'
+      - run: test/run.sh
+      - run: bin/dangle skill --print | diff - skill/SKILL.md
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          v=${GITHUB_REF_NAME#v}
+          mkdir -p "dangle-$v/bin" && cp bin/dangle "dangle-$v/bin/" && cp -r README.md LICENSE skill examples "dangle-$v/"
+          tar czf "dangle-$v.tar.gz" "dangle-$v"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dangle-*.tar.gz

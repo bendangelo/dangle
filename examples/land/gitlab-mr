@@ -1,0 +1,13 @@
+#!/bin/sh
+# .dangle/hooks/land: land through a GitLab merge request that merges when its pipeline passes.
+#
+# This hands off: dangle marks the plan "submitted" and skips it until GitLab has merged it
+# (the plan shows up in done/ on the base branch). Plans that depend on it wait until then.
+#
+# Needs: glab (signed in).
+set -e
+git push -q --force-with-lease "${DANGLE_REMOTE:-origin}" "HEAD:refs/heads/$DANGLE_BRANCH"
+glab mr view "$DANGLE_BRANCH" >/dev/null 2>&1 ||
+  glab mr create --source-branch "$DANGLE_BRANCH" --target-branch "$DANGLE_BASE" \
+    --title "$DANGLE_TITLE" --description "$(cat "$DANGLE_MESSAGE_FILE")" --yes
+glab mr merge "$DANGLE_BRANCH" --when-pipeline-succeeds --squash --remove-source-branch --yes

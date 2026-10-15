@@ -1,0 +1,21 @@
+#!/bin/sh
+# .dangle/hooks/land: land through a GitHub pull request and its CI checks.
+#
+# dangle runs this after the gate passes, in the plan's worktree, holding the land lock.
+# It pushes the branch, opens a pull request, waits for CI, and squash-merges it. Exit 0 =
+# landed; anything else keeps the worktree and marks the plan failed.
+#
+# To hand off without waiting (the PR merges later, by a person or a merge queue), drop the
+# `gh pr checks` and `gh pr merge` lines: dangle then marks the plan "submitted" and skips
+# it until the plan shows up in done/ on the base branch.
+#
+# Needs: gh (signed in). Environment from dangle: DANGLE_BRANCH, DANGLE_BASE, DANGLE_REMOTE,
+# DANGLE_TITLE, DANGLE_MESSAGE_FILE, DANGLE_PRIMARY, DANGLE_WORKTREE.
+set -e
+git push -q --force-with-lease "${DANGLE_REMOTE:-origin}" "HEAD:refs/heads/$DANGLE_BRANCH"
+gh pr view "$DANGLE_BRANCH" >/dev/null 2>&1 ||
+  gh pr create --base "$DANGLE_BASE" --head "$DANGLE_BRANCH" \
+    --title "$DANGLE_TITLE" --body-file "$DANGLE_MESSAGE_FILE"
+sleep 10   # give CI a moment to register its checks
+gh pr checks "$DANGLE_BRANCH" --watch --fail-fast
+gh pr merge "$DANGLE_BRANCH" --squash --delete-branch --subject "$DANGLE_TITLE"
