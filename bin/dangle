@@ -9,7 +9,7 @@
 set -u
 LC_ALL=C
 export LC_ALL
-VERSION=0.1.5
+VERSION=0.1.6
 
 # ---------------------------------------------------------------- output
 
@@ -78,9 +78,15 @@ find_repo() {
 
 trim() { printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 
-# .dangle/config is KEY=value lines. It is read, never run: a value is taken literally.
+# A config is KEY=value lines. It is read, never run: a value is taken literally. Your own
+# (~/.config/dangle/config: your agent, your aliases) is read first; the repository's
+# .dangle/config wins where both set a key; DANGLE_* environment variables win over both.
 load_config() {
-  local f="$DOT/config" line key val
+  read_config "${XDG_CONFIG_HOME:-$HOME/.config}/dangle/config"
+  read_config "$DOT/config"
+}
+read_config() {
+  local f="$1" line key val
   [ -f "$f" ] || return 0
   while IFS= read -r line || [ -n "$line" ]; do
     line=$(trim "$line")
@@ -139,6 +145,7 @@ settings() {
   MAX_LINES=$(cfg MAX_LINES 300)
   AGENT_SECS=$(to_secs "$(cfg AGENT_TIMEOUT 4h)")
   GATE_SECS=$(to_secs "$(cfg GATE_TIMEOUT 60m)")
+  HB_SECS=$(to_secs "$(cfg HEARTBEAT 5m)")
   REMOTE=${DANGLE_REMOTE:-$(cfg REMOTE origin)}
   if [ "$REMOTE" = none ] || ! git remote get-url "$REMOTE" >/dev/null 2>&1; then REMOTE=; fi
   TIMEOUT_BIN=
@@ -212,6 +219,24 @@ run_limited() {
   return $rc
 }
 
+# heartbeat <what> <log>: every HEARTBEAT (5m) while something runs, one line: how long it
+# has run and the last line of its log. Stopped with stop_heartbeat.
+HB=
+heartbeat() {
+  [ "$HB_SECS" -gt 0 ] || return 0
+  local what="$1" log="$2" start
+  start=$(date +%s)
+  (
+    trap 'exit 0' TERM
+    while sleep "$HB_SECS"; do
+      line=$(tail -n 40 "$log" 2>/dev/null | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/\r//g' | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-90)
+      say "  ...    $what $(minutes "$start" "$(date +%s)")${line:+  │ $line}"
+    done
+  ) &
+  HB=$!
+}
+stop_heartbeat() { [ -n "$HB" ] && kill "$HB" 2>/dev/null; HB=; return 0; }
+
 # hook <name> <dir> [args...]: runs .dangle/hooks/<name> in <dir> if it exists.
 hook() {
   local name="$1" dir="$2"
@@ -256,6 +281,7 @@ claim() {
 unclaim() { drop_lock "$STATE/claims/$1"; }
 
 cleanup() {
+  stop_heartbeat
   [ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null
   local d
   for d in "$STATE"/claims/*; do [ -d "$d" ] && drop_lock "$d"; done
@@ -423,7 +449,12 @@ landed_ids() {
   fi
   cat "$cache"
 }
-is_landed() { landed_ids | grep -Fqx -- "$1"; }
+# is_id <id> <name>: an id names a plan when it is the plan's id or its first words
+# (`shop-A1` names `shop-A1-report-links`, never `shop-A10-guides`).
+is_id() { [ "$2" = "$1" ] || case $2 in "$1"-*) true ;; *) false ;; esac; }
+is_landed() {
+  landed_ids | awk -v d="$1" '$0 == d || index($0, d "-") == 1 { f = 1 } END { exit !f }'
+}
 
 # find_plan <id or part of a name>: the active plan file.
 find_plan() {
@@ -431,6 +462,11 @@ find_plan() {
   for f in $(plan_files); do
     [ "$(plan_id "$f")" = "$want" ] && { printf '%s' "$f"; return 0; }
   done
+  for f in $(plan_files); do
+    is_id "$want" "$(plan_id "$f")" && { hits="$hits $f"; n=$((n + 1)); }
+  done
+  [ $n = 1 ] && { printf '%s' "${hits# }"; return 0; }
+  hits='' n=0
   for f in $(plan_files); do
     case ${f##*/} in *"$want"*) hits="$hits $f"; n=$((n + 1)) ;; esac
   done
@@ -443,8 +479,9 @@ find_plan() {
 # unmet <file> [ids taken as landed]: the dependencies of a plan that have not landed.
 unmet() {
   local d
+  local a
   for d in $(plan_field "$1" depends | tr ',' ' '); do
-    case " ${2-} " in *" $d "*) continue ;; esac
+    for a in ${2-}; do is_id "$d" "$a" && continue 2; done
     is_landed "$d" || printf '%s\n' "$d"
   done
 }
@@ -459,9 +496,13 @@ first_ready() {
 }
 # running_elsewhere <id>: another live dangle has claimed the plan.
 running_elsewhere() {
-  local pid
-  pid=$(cat "$STATE/claims/$1/pid" 2>/dev/null) || return 1
-  [ -n "$pid" ] && [ "$pid" != $$ ] && kill -0 "$pid" 2>/dev/null
+  local c pid
+  for c in "$STATE"/claims/*; do
+    [ -d "$c" ] && is_id "$1" "${c##*/}" || continue
+    pid=$(cat "$c/pid" 2>/dev/null) || continue
+    [ -n "$pid" ] && [ "$pid" != $$ ] && kill -0 "$pid" 2>/dev/null && return 0
+  done
+  return 1
 }
 
 without() { printf '%s\n' "$1" | grep -Fxv -- "$2"; }
@@ -488,6 +529,16 @@ Do not merge, push, or edit the plan file.
 
 {{gate_tail}}'
 
+DEFAULT_AUDIT_PROMPT='Do not change, create or delete any file, and do not commit: this is a read-only check.
+
+Read the implementation plan in {{plan}}. Then look at this repository'"'"'s code, tests and git log
+to decide how much of the plan is already done.
+
+End your reply with exactly one line, the last line:
+DANGLE-AUDIT: done            (every task of the plan is already in the code)
+DANGLE-AUDIT: partial <what is still missing, in a few words>
+DANGLE-AUDIT: todo            (little or none of it is done)'
+
 # render <template text>: fills {{name}} from DANGLE_T_name.
 render() {
   printf '%s\n' "$1" | awk '{
@@ -512,7 +563,7 @@ run_agent() {
   resolve_agent "$spec" "$(cfg AGENT)"
   say "  agent  $AGENT_LABEL  (log $log)"
   printf '\n=== %s  %s ===\n' "$(date)" "$AGENT_LABEL" >> "$log"
-  if [ "${FOLLOW:-0}" = 1 ]; then tail -n 0 -f "$log" & tailer=$!; fi
+  if [ "${FOLLOW:-0}" = 1 ]; then tail -n 0 -f "$log" & tailer=$!; else heartbeat agent "$log"; fi
   (
     cd "$dir" || exit 1
     set -f; set -- $AGENT_CMD; set +f
@@ -520,6 +571,7 @@ run_agent() {
     run_limited "$AGENT_SECS" "$@" "$prompt" < /dev/null >> "$log" 2>&1
   )
   rc=$?
+  stop_heartbeat
   [ -n "$tailer" ] && kill "$tailer" 2>/dev/null
   [ $rc = 124 ] && say "  agent  stopped after $(cfg AGENT_TIMEOUT 4h)"
   return $rc
@@ -538,8 +590,10 @@ run_gate() {
   local dir="$1" log="$2" plan="${3-}" dw rc
   printf '=== gate %s ===\n' "$(date)" > "$log"
   if has_hook gate; then
+    heartbeat gate "$log"
     run_limited "$GATE_SECS" sh -c 'cd "$1" && DANGLE_HOOK=gate exec "$2"' sh "$dir" "$HOOKS/gate" >> "$log" 2>&1
     rc=$?
+    stop_heartbeat
     [ $rc = 124 ] && echo "dangle: the gate ran longer than $(cfg GATE_TIMEOUT 60m)" >> "$log"
     [ $rc = 0 ] || return 1
   else
@@ -688,6 +742,8 @@ dangle: a carrot on a stick for your coding agent.
   dangle [ids...] [options]     run the active plans in order (or only these ids)
   dangle status                 every active plan: ready, waiting, running, failed
   dangle lint                   check the active plans (size, ids, dependencies)
+  dangle audit [ids] [--apply]  ask the agent which plans are already implemented (read-only);
+                                --apply moves those to the done folder in one commit
   dangle doctor [--agent]       check the setup (--agent also asks the agent to reply)
   dangle init                   create .dangle/ for this repository
   dangle skill [--print]        install the plan-writing skill for your agents
@@ -710,7 +766,8 @@ Run options:
   -q, --quiet           no art
 
 Environment: DANGLE_AGENT, DANGLE_FIX_AGENT, DANGLE_REMOTE (none = do not fetch or push).
-Configuration: .dangle/config, .dangle/copy, .dangle/hooks/*, .dangle/prompt.md (see README).
+Configuration: ~/.config/dangle/config (yours: AGENT=, ALIAS_), then the repository's
+.dangle/config, .dangle/copy, .dangle/hooks/*, .dangle/prompt.md (see README).
 EOF
 }
 
@@ -941,7 +998,7 @@ cmd_lint() {
     [ "$lines" -le "$MAX_LINES" ] || { say "warning: ${f##*/}: $lines lines (MAX_LINES=$MAX_LINES); split it?"; warnings=$((warnings + 1)); }
     [ -n "$(plan_title "$f")" ] || { say "warning: ${f##*/}: no '# title' line"; warnings=$((warnings + 1)); }
     for d in $(plan_field "$f" depends | tr ',' ' '); do
-      printf '%s\n' "$all" | grep -Fqx "$d" || { err "${f##*/}: depends on $d, which is neither active nor landed"; errors=$((errors + 1)); }
+      printf '%s\n' "$all" | awk -v d="$d" '$0 == d || index($0, d "-") == 1 { f = 1 } END { exit !f }' || { err "${f##*/}: depends on $d, which is neither active nor landed"; errors=$((errors + 1)); }
     done
   done
   # The project's own checks: .dangle/hooks/lint <plan files>; a non-zero exit is an error.
@@ -987,6 +1044,73 @@ cmd_doctor() {
     case $out in *OK*) ok "the agent replied" ;; *) no "the agent did not reply OK:"; printf '%s\n' "$out" | tail -n 15 | sed 's/^/        /' ;; esac
   fi
   return $bad
+}
+
+# ---------------------------------------------------------------- audit
+
+# dangle audit [ids] [-a agent] [--apply]: asks the agent, plan by plan, whether a plan is
+# already implemented (for a repository whose plans folder fell behind its code). It runs in
+# a throwaway checkout of the base branch and changes nothing; --apply then moves the plans
+# found done to the done folder in one commit.
+cmd_audit() {
+  local ids='' apply=0 agent='' f id queue='' path log verdict report n=0 found='' bw
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -a|--agent) agent=${2-}; shift ;;
+      --agent=*) agent=${1#*=} ;;
+      --apply) apply=1 ;;
+      -q|--quiet) QUIET=1 ;;
+      -*) die "unknown option $1" ;;
+      *) ids="$ids $1" ;;
+    esac
+    shift
+  done
+  for id in $ids; do f=$(find_plan "$id") || die "no active plan '$id'"; queue="$queue $f"; done
+  [ -n "$ids" ] || queue=$(plan_files)
+  [ -n "$queue" ] || { say "dangle: no active plans in $PLANS"; return 0; }
+  agent=${agent:-${DANGLE_AGENT:-$(cfg AGENT)}}
+  resolve_agent "$agent" "$(cfg AGENT)"
+  path="$PRIMARY/$WORKTREES/.dangle-audit"
+  [ -d "$path" ] && git worktree remove --force "$path"
+  ensure_excluded
+  git worktree add -q --detach "$path" "refs/heads/$BASE" || die "could not make a checkout of $BASE"
+  trap 'cleanup; git worktree remove --force "$path" 2>/dev/null; exit 130' INT TERM
+  report="$STATE/audit.md"
+  printf '# dangle audit %s (agent %s)\n\n' "$(date)" "$AGENT_LABEL" > "$report"
+  say "dangle audit: $(printf '%s\n' $queue | wc -l | tr -d ' ') plan(s) with $AGENT_LABEL, read-only"
+  for f in $queue; do
+    n=$((n + 1)); id=$(plan_id "$f"); log="$STATE/logs/$id.audit.log"
+    : > "$log"
+    say ""
+    say "  $id  $(plan_title "$f")"
+    DANGLE_T_plan="$PLANS/${f##*/}"; export DANGLE_T_plan
+    run_agent "$agent" "$path" "$log" "$(render "$(template audit-prompt.md "$DEFAULT_AUDIT_PROMPT")")"
+    git -C "$path" reset -q --hard && git -C "$path" clean -qfd
+    verdict=$(sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$log" | grep -o 'DANGLE-AUDIT: .*' | tail -n 1 | sed 's/^DANGLE-AUDIT: *//; s/[*`]*$//')
+    case $verdict in
+      done*) found="$found $f" ;;
+      partial*|todo*) ;;
+      *) verdict="unknown (no DANGLE-AUDIT line; log $log)" ;;
+    esac
+    say "  audit  $verdict"
+    printf -- '- %s %s: %s\n' "$id" "$(plan_title "$f")" "$verdict" >> "$report"
+  done
+  git worktree remove --force "$path"
+  say ""
+  say "  report: $report"
+  [ -n "$found" ] || { say "  no plan was found done"; return 0; }
+  if [ $apply = 0 ]; then
+    say "  $(printf '%s\n' $found | wc -l | tr -d ' ') found done. Check them, then: dangle audit --apply$ids (moves them to $PLANS/$DONE/ in one commit)"
+    return 0
+  fi
+  bw=$(base_checkout)
+  [ -n "$bw" ] || die "--apply needs $BASE checked out (to commit the moves)"
+  require_clean_base
+  mkdir -p "$bw/$PLANS/$DONE"
+  for f in $found; do git -C "$bw" mv "$PLANS/${f##*/}" "$PLANS/$DONE/${f##*/}"; done
+  git -C "$bw" commit -q -m "dangle audit: $(printf '%s\n' $found | wc -l | tr -d ' ') plan(s) already implemented" \
+    -m "$(for f in $found; do printf -- '- %s\n' "$(plan_title "$bw/$PLANS/$DONE/${f##*/}")"; done)"
+  say "  moved to $PLANS/$DONE/ and committed on $BASE: $(git -C "$bw" rev-parse --short HEAD) (not pushed)"
 }
 
 # ---------------------------------------------------------------- init
@@ -1122,8 +1246,11 @@ does it land. Subfolders are inactive: `done/` holds landed plans, and any other
 ## Preparing an existing repository
 
 1. Run `dangle init` if `.dangle/` is missing, and check `.dangle/hooks/gate` really checks.
-2. List the plans folder. For each plan, decide from the code and `git log` whether it is
-   already done; move done ones to `done/` with `git mv`.
+2. Find the plans that are already done: `dangle audit` asks the agent about each plan
+   (read-only; a strong model is worth it here: `dangle audit -a claude:sonnet`) and writes
+   `.git/dangle/audit.md`. Check the ones it calls done, then `dangle audit --apply` moves them
+   to `done/` in one commit. A plan it calls partial gets a short "Corrections" section at
+   the top saying what is already there and what is left.
 3. Park plans that need a human decision in `hold/`.
 4. Put the rest in dependency order, and rename them `NNN-name.md` (keep a leading date if
    the repository uses one), with gaps of 10 so later plans fit between.
@@ -1132,6 +1259,8 @@ does it land. Subfolders are inactive: `done/` holds landed plans, and any other
 
 ## Running
 
+- Ids: a plan's number, or without one its name after the date; the first words of a name
+  work too (`shop-A1` for `shop-A1-report-links`), in `depends=` as well.
 - `dangle` runs everything; `dangle 865 870` runs only those; `dangle 865 --rest` runs 865 first,
   then the rest. `-a claude:haiku` picks the agent for this run.
 - One plan runs at a time. For more, start a second `dangle` in another terminal: runners
@@ -1248,7 +1377,7 @@ main() {
   find_repo
   settings
   case ${1-} in
-    status|lint|doctor|init|skill|new|land|rm|list|path) ;;
+    status|lint|doctor|init|skill|new|land|rm|list|path|audit) ;;
     *)
       # A run keeps the computer awake for the night.
       if [ -z "${DANGLE_AWAKE:-}" ] && command -v systemd-inhibit >/dev/null 2>&1 &&
@@ -1259,6 +1388,7 @@ main() {
   case ${1-} in
     run) shift; cmd_run "$@" ;;
     status) cmd_status ;;
+    audit) shift; cmd_audit "$@" ;;
     lint) cmd_lint ;;
     doctor) shift; cmd_doctor "$@" ;;
     init) cmd_init ;;

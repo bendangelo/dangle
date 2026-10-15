@@ -39,8 +39,11 @@ does it land. Subfolders are inactive: `done/` holds landed plans, and any other
 ## Preparing an existing repository
 
 1. Run `dangle init` if `.dangle/` is missing, and check `.dangle/hooks/gate` really checks.
-2. List the plans folder. For each plan, decide from the code and `git log` whether it is
-   already done; move done ones to `done/` with `git mv`.
+2. Find the plans that are already done: `dangle audit` asks the agent about each plan
+   (read-only; a strong model is worth it here: `dangle audit -a claude:sonnet`) and writes
+   `.git/dangle/audit.md`. Check the ones it calls done, then `dangle audit --apply` moves them
+   to `done/` in one commit. A plan it calls partial gets a short "Corrections" section at
+   the top saying what is already there and what is left.
 3. Park plans that need a human decision in `hold/`.
 4. Put the rest in dependency order, and rename them `NNN-name.md` (keep a leading date if
    the repository uses one), with gaps of 10 so later plans fit between.
@@ -49,6 +52,8 @@ does it land. Subfolders are inactive: `done/` holds landed plans, and any other
 
 ## Running
 
+- Ids: a plan's number, or without one its name after the date; the first words of a name
+  work too (`shop-A1` for `shop-A1-report-links`), in `depends=` as well.
 - `dangle` runs everything; `dangle 865 870` runs only those; `dangle 865 --rest` runs 865 first,
   then the rest. `-a claude:haiku` picks the agent for this run.
 - One plan runs at a time. For more, start a second `dangle` in another terminal: runners

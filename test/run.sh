@@ -8,7 +8,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 pass=0 failed=0
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
-export DANGLE_AWAKE=1 NO_COLOR=1
+export DANGLE_AWAKE=1 NO_COLOR=1 XDG_CONFIG_HOME="$tmp/xdg"
 
 ok() { pass=$((pass + 1)); printf '  ok    %s\n' "$1"; }
 no() { failed=$((failed + 1)); printf '  FAIL  %s\n' "$1"; [ -n "${2-}" ] && printf '%s\n' "$2" | sed 's/^/        /'; }
@@ -20,6 +20,12 @@ cat > "$tmp/agent" <<'EOF'
 #!/bin/sh
 prompt=$(eval "printf '%s' \"\${$#}\"")
 case $prompt in *"Reply with the single word OK"*) echo OK; exit 0 ;; esac
+case $prompt in *"read-only check"*)
+  p=$(printf '%s\n' "$prompt" | sed -n 's/.*plan in \([^ ]*\.md\).*/\1/p' | head -n 1)
+  touch SHOULD-BE-UNDONE
+  if [ -e "$(sed -n 's/^Create: //p' "$p")" ]; then echo "DANGLE-AUDIT: done"; else echo "DANGLE-AUDIT: todo"; fi
+  exit 0 ;;
+esac
 plan=$(printf '%s\n' "$prompt" | sed -n 's/.*plan in \([^ ,]*\.md\).*/\1/p' | head -n 1)
 case $prompt in *"The gate failed"*) rm -f BAD; git add -A; git commit -qm "fix: remove BAD"; exit 0 ;; esac
 grep -q '^Agent: idle' "$plan" && exit 0
@@ -251,6 +257,45 @@ printf '#!/bin/sh\n! grep -l -- "cargo test -p" "$@"\n' > .dangle/hooks/lint
 chmod +x .dangle/hooks/lint
 "$DANGLE" lint > "$tmp/out" 2>&1; rc=$?
 check "a lint hook adds the project's own checks" '[ $rc = 1 ] && grep -q "010-a.md" "$tmp/out" && grep -q "1 error" "$tmp/out"'
+
+repo audit
+echo made > old.txt && git add old.txt && git commit -qm "old work" && git push -q origin main
+plan 010-old.md old.txt
+plan 020-new.md new.txt
+commit
+"$DANGLE" audit > "$tmp/out" 2>&1
+check "audit finds a plan already done, changes nothing" 'grep -q "audit  done" "$tmp/out" && grep -q "audit  todo" "$tmp/out" && [ -f plans/010-old.md ] && [ ! -e SHOULD-BE-UNDONE ] && [ -z "$(git status --porcelain)" ]'
+"$DANGLE" audit --apply > "$tmp/out" 2>&1
+check "audit --apply moves the done plans in one commit" '[ -f plans/done/010-old.md ] && [ -f plans/020-new.md ] && git log -1 --format=%s | grep -q "1 plan(s) already implemented"'
+
+repo shortids
+plan 2026-10-12-shop-A1-links.md a.txt
+plan 2026-10-12-shop-A10-guides.md b.txt '<!-- dangle: depends=shop-A1 -->'
+commit
+"$DANGLE" -n > "$tmp/out" 2>&1
+check "a short id names a plan by its first words" '[ "$(awk "NR>1{print \$1}" "$tmp/out" | tr "\n" " ")" = "shop-A1-links shop-A10-guides " ]'
+"$DANGLE" -y shop-A1 > "$tmp/out" 2>&1
+check "dangle shop-A1 runs shop-A1, not shop-A10" '[ -f a.txt ] && [ ! -f b.txt ]'
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "depends=shop-A1 is met once shop-A1-links lands" '[ -f b.txt ]'
+
+repo userconfig
+mkdir -p "$XDG_CONFIG_HOME/dangle"
+printf 'AGENT=pi:ollama-local/qwen3.8:latest\nALIAS_q=pi:x\n' > "$XDG_CONFIG_HOME/dangle/config"
+printf 'BASE=main\nPLANS=plans\n' > .dangle/config
+check "the user config sets the agent when the repository does not" '[ "$(res opus)" = "pi:opus|pi -p --approve --model opus" ] && [ "$(res q)" = "pi:x|pi -p --approve --model x" ]'
+printf 'BASE=main\nPLANS=plans\nAGENT=codex\n' > .dangle/config
+check "the repository config wins over the user config" '[ "$(res o3)" = "codex:o3|codex exec --dangerously-bypass-approvals-and-sandbox --model o3" ]'
+rm -rf "$XDG_CONFIG_HOME/dangle"
+
+repo heartbeat
+plan 010-slow.md s.txt
+commit
+printf 'BASE=main\nPLANS=plans\nAGENT=%s\nHEARTBEAT=1s\n' "$tmp/slow-agent" > .dangle/config
+printf '#!/bin/sh\necho "compiling things"\nsleep 3\nexec "%s" "$@"\n' "$tmp/agent" > "$tmp/slow-agent"; chmod +x "$tmp/slow-agent"
+commit "slow agent"
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "a heartbeat line shows the time and the last line of output" 'grep -q "\.\.\.    agent [0-9]*s  │ compiling things" "$tmp/out" && [ -f s.txt ]'
 
 echo
 echo "$pass passed, $failed failed"

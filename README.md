@@ -37,7 +37,7 @@ run them overnight. It also works with plans from anywhere else: they are just M
 ## Install
 
 ```sh
-mise use -g github:bendangelo/dangle@0.1.5
+mise use -g github:bendangelo/dangle@0.1.6
 # (plain `github:bendangelo/dangle` works too, once a release is a day old: mise's
 #  minimum_release_age)
 # or
@@ -75,7 +75,9 @@ Done when: `cargo test payroll_employee`
 ```
 
 - The id is the plan's number: `2026-10-14-865-name.md` and `865-name.md` are both `865`. A plan
-  without a number goes by its name, and any unique part of a name works too.
+  without a number goes by its name after the date, and its first words work too: `shop-A1`
+  names `2026-10-12-shop-A1-report-links.md` (never `shop-A10-…`), on the command line and in
+  `depends=`.
 - `depends=` holds a plan back until those plans have landed (a dependency that fails holds it
   for the night). `agent=` picks the agent for it.
 - `Done when:` is a command dangle runs after the gate; the plan lands only when it passes.
@@ -93,6 +95,19 @@ dangle -a claude:haiku         # pick the agent for this run
 dangle -a opus                 # the default agent with another model
 dangle status                  # ready, waiting, running, kept, submitted
 dangle 866                     # continue a failed plan in its kept worktree (--fresh: start over)
+```
+
+While an agent or the gate runs, a line every 5 minutes says how long it has run and what it
+printed last (`HEARTBEAT=5m`, `0` turns it off):
+
+```
+  865  Payroll: employee master file
+  agent  pi:ollama-local/qwen3.8:latest  (log .git/dangle/logs/865.log)
+  ...    agent 5m  │ Compiling operations v0.1.0
+  ...    agent 10m  │ test payroll::employees::tests::creates ... ok
+  gate   running (log .git/dangle/logs/865.gate.log)
+  ...    gate 5m  │ gate: test passed in 115.7s
+  land   3e25cb7 on dev (pushed to origin)
 ```
 
 For each plan dangle creates the worktree `.worktrees/plan-<id>` from the base branch, runs
@@ -129,9 +144,32 @@ the model is down) instead of failing every plan in minutes. The computer is kep
 (`systemd-inhibit` or `caffeinate`). The summary is in `.git/dangle/last-run.md`, and the
 logs are in `.git/dangle/logs/`.
 
+## Plans that are already done
+
+A repository's plans folder often falls behind its code: some plans were carried out by hand,
+or by an earlier runner, and never moved. Running them again wastes a night. `dangle audit`
+asks the agent about each active plan in a throwaway checkout (it changes nothing):
+
+```sh
+dangle audit -a claude:sonnet      # a strong model is worth it for this
+cat .git/dangle/audit.md           # done / partial <what is missing> / todo, per plan
+dangle audit --apply               # moves the ones found done to done/, in one commit
+```
+
+Check the plans it calls done before `--apply`. A plan it calls partial is worth a short
+"Corrections" section at the top saying what is already there; the skill from `dangle skill`
+walks an agent through all of this.
+
 ## Agents
 
-`AGENT=` in the config, `-a` for one run, or `agent=` in one plan:
+`AGENT=` in the config, `-a` for one run, or `agent=` in one plan. Your own default for every
+repository goes in `~/.config/dangle/config` (a repository's `.dangle/config` wins over it):
+
+```sh
+mkdir -p ~/.config/dangle
+echo 'AGENT=pi:ollama-local/qwen3.8:latest' >> ~/.config/dangle/config
+```
+
 
 | Spec | Runs |
 |---|---|
@@ -166,6 +204,7 @@ node_modules into new worktrees" or "land through a GitHub PR and wait for CI".
 | `hooks/regate <old> <new>` | the base moved during a gate | exit 1 = no second gate (e.g. only docs changed) |
 | `hooks/land` | landing, after the gate | replaces the built-in squash-and-push |
 | `hooks/teardown` | before a worktree is removed | save a build cache for the next one |
+| `audit-prompt.md` | `dangle audit` | the audit prompt, with `{{plan}}` |
 | `hooks/lint <plans>` | `dangle lint` | your own plan checks (skill names exist, no forbidden commands); exit non-zero = error |
 | `hooks/done <summary>` | end of a run | notify yourself: `notify-send`, ntfy, e-mail |
 | `prompt.md`, `fix-prompt.md` | each agent run | the prompts, with `{{plan}}`, `{{branch}}`, `{{base}}`, `{{gate}}`, `{{gate_log}}`, `{{gate_tail}}` |
@@ -214,6 +253,7 @@ REMOTE=origin        # none: never fetch or push
 WORKTREES=.worktrees
 BRANCH_PREFIX=plan-
 MAX_LINES=300
+HEARTBEAT=5m         # a progress line while an agent or the gate runs; 0 = off
 ALIAS_cheap=claude:haiku
 ```
 
