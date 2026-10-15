@@ -230,6 +230,28 @@ repo inside
 check "dangle land from inside the worktree removes it and its branch" '[ $rc = 0 ] && [ ! -d .worktrees/fix-typo ] && [ -z "$(git branch --list fix-typo)" ]'
 check "a branch of one commit lands under that commit's subject" '[ "$(git log -1 --format=%s main)" = "Fix the typo" ]'
 
+repo parallel
+plan 010-a.md a.txt
+plan 020-b.md b.txt '<!-- dangle: depends=010 -->'
+commit
+sleep 300 & other=$!
+mkdir -p .git/dangle/claims/010 && echo $other > .git/dangle/claims/010/pid
+DANGLE_POLL=1 "$DANGLE" -y 020 > "$tmp/out" 2>&1 & run=$!
+sleep 3
+# The other terminal lands 010.
+git mv plans/010-a.md plans/done/ 2>/dev/null || { mkdir -p plans/done && git mv plans/010-a.md plans/done/; }
+echo a > a.txt && git add -A && git commit -qm "Plan 010" && git push -q origin main
+kill $other; wait $run; rc=$?
+check "a plan waits for a dependency another dangle is running, then runs" '[ $rc = 0 ] && grep -q "waiting for 010" "$tmp/out" && [ -f b.txt ]'
+
+repo linthook
+plan 010-a.md a.txt 'Run cargo test -p db'
+commit
+printf '#!/bin/sh\n! grep -l -- "cargo test -p" "$@"\n' > .dangle/hooks/lint
+chmod +x .dangle/hooks/lint
+"$DANGLE" lint > "$tmp/out" 2>&1; rc=$?
+check "a lint hook adds the project's own checks" '[ $rc = 1 ] && grep -q "010-a.md" "$tmp/out" && grep -q "1 error" "$tmp/out"'
+
 echo
 echo "$pass passed, $failed failed"
 [ $failed = 0 ]

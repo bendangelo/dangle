@@ -51,6 +51,8 @@ does it land. Subfolders are inactive: `done/` holds landed plans, and any other
 
 - `dangle` runs everything; `dangle 865 870` runs only those; `dangle 865 --rest` runs 865 first,
   then the rest. `-a claude:haiku` picks the agent for this run.
+- One plan runs at a time. For more, start a second `dangle` in another terminal: runners
+  claim plans, skip what another one runs, and wait for a dependency another one is running.
 - `dangle status` shows what is ready, waiting, running or failed. A failed plan keeps its
   worktree: `dangle 866` continues it, `--fresh` starts it over, `dangle land 866` lands it
   after you fixed it by hand.

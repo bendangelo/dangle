@@ -37,7 +37,7 @@ run them overnight. It also works with plans from anywhere else: they are just M
 ## Install
 
 ```sh
-mise use -g github:bendangelo/dangle@0.1.3
+mise use -g github:bendangelo/dangle@0.1.4
 # (plain `github:bendangelo/dangle` works too, once a release is a day old: mise's
 #  minimum_release_age)
 # or
@@ -101,8 +101,28 @@ the agent, commits anything it left uncommitted, merges the base branch in, move
 (`FIXES=`) with the gate's output. Then, under a lock, it lands: squashes the branch onto the
 base branch and pushes it. A plan that fails keeps its worktree for you to look at.
 
-A second `dangle` can run beside the first: `dangle 866` while the night's run is going claims
-866, and the main run skips it. Landings take turns.
+### One plan at a time, more runners when you want them
+
+By default a run works on **one plan at a time**. That keeps everything simple: one agent, one
+build, one gate on the machine; a plan always starts from a base branch that already has the
+plans before it; and nothing ever needs to merge two agents' work at once.
+
+When the machine has room for more, open another terminal in the same repository and start
+another `dangle`. Runners in one repository share the work safely:
+
+- each plan is **claimed** by the runner that starts it, and the others skip it;
+- a plan that depends on one another runner is working on **waits** for it to land, then runs;
+- **landings take turns** (one lock), and each landing merges in what the others landed first.
+
+```sh
+dangle                 # terminal 1: the night's run
+dangle                 # terminal 2: a second runner on the same queue
+dangle 866             # or: just this one plan, beside the main run
+```
+
+Claims live in `.git/dangle/`, so they are per clone: runners on two computers do not see each
+other's claims. Give each computer its own ids (`dangle 864 865` on one, `dangle 872 873` on
+the other).
 
 The night stops early when the agent fails fast twice in a row (out of credit, signed out,
 the model is down) instead of failing every plan in minutes. The computer is kept awake
@@ -146,6 +166,7 @@ node_modules into new worktrees" or "land through a GitHub PR and wait for CI".
 | `hooks/regate <old> <new>` | the base moved during a gate | exit 1 = no second gate (e.g. only docs changed) |
 | `hooks/land` | landing, after the gate | replaces the built-in squash-and-push |
 | `hooks/teardown` | before a worktree is removed | save a build cache for the next one |
+| `hooks/lint <plans>` | `dangle lint` | your own plan checks (skill names exist, no forbidden commands); exit non-zero = error |
 | `hooks/done <summary>` | end of a run | notify yourself: `notify-send`, ntfy, e-mail |
 | `prompt.md`, `fix-prompt.md` | each agent run | the prompts, with `{{plan}}`, `{{branch}}`, `{{base}}`, `{{gate}}`, `{{gate_log}}`, `{{gate_tail}}` |
 
