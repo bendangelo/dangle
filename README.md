@@ -24,14 +24,20 @@ gate checks it, and only what passes lands.
 ```
 
 It is one POSIX shell script. It needs `git` and an agent CLI, and it works with any language,
-any agent ([pi](https://github.com/badlogic/pi-mono), [opencode](https://opencode.ai),
-[Claude Code](https://claude.com/claude-code), Codex, or your own command) and any way of
-landing (straight onto a branch, or through pull requests and CI).
+any agent ([Claude Code](https://claude.com/claude-code) by default,
+[Codex](https://github.com/openai/codex), [opencode](https://opencode.ai),
+[pi](https://github.com/badlogic/pi-mono), or your own command) and any way of landing
+(straight onto a branch, or through pull requests and CI).
+
+**Made for [superpowers](https://github.com/obra/superpowers).** Superpowers' brainstorming and
+writing-plans skills write plans to `docs/superpowers/plans/`, which is where dangle looks
+first. Use a strong model during the day to brainstorm and write the plans, then let dangle
+run them overnight. It also works with plans from anywhere else: they are just Markdown files.
 
 ## Install
 
 ```sh
-mise use -g github:bendangelo/dangle@0.1.2
+mise use -g github:bendangelo/dangle@0.1.3
 # (plain `github:bendangelo/dangle` works too, once a release is a day old: mise's
 #  minimum_release_age)
 # or
@@ -84,7 +90,7 @@ dangle                         # every active plan, in order
 dangle 865 870                 # only these, in this order, then stop
 dangle 865 --rest              # 865 first, then everything else
 dangle -a claude:haiku         # pick the agent for this run
-dangle -a qwen3.8:latest       # the default agent with another model
+dangle -a opus                 # the default agent with another model
 dangle status                  # ready, waiting, running, kept, submitted
 dangle 866                     # continue a failed plan in its kept worktree (--fresh: start over)
 ```
@@ -109,11 +115,11 @@ logs are in `.git/dangle/logs/`.
 
 | Spec | Runs |
 |---|---|
-| `pi`, `pi:ollama-local/qwen3.8:latest` | `pi -p --approve [--model …]` |
-| `opencode`, `opencode:anthropic/claude-sonnet-5-5` | `opencode run --auto [--model …]` |
-| `claude`, `claude:haiku` | `claude -p --dangerously-skip-permissions [--model …]` |
+| `claude` (the default), `claude:haiku` | `claude -p --dangerously-skip-permissions [--model …]` |
 | `codex`, `codex:gpt-5` | `codex exec --dangerously-bypass-approvals-and-sandbox [--model …]` |
-| `qwen3.8:latest` | the default agent with this model |
+| `opencode`, `opencode:anthropic/claude-sonnet-5-5` | `opencode run --auto [--model …]` |
+| `pi`, `pi:ollama/qwen3` | `pi -p --approve [--model …]` |
+| `opus` | the default agent with this model |
 | `cheap` | `ALIAS_cheap=claude:haiku` from the config |
 | `./scripts/my-agent` | your own command |
 
@@ -178,8 +184,8 @@ dangle rm my-fix               # teardown, then remove
 BASE=main            # the branch plans land on (default: origin's HEAD, main, master)
 PLANS=docs/plans     # the plans folder
 DONE=done            # landed plans move to PLANS/DONE
-AGENT=pi:ollama-local/qwen3.8:latest
-FIX_AGENT=claude:sonnet
+AGENT=claude:sonnet   # default: claude
+FIX_AGENT=claude:opus
 FIXES=1              # fix-up runs after a failed gate
 AGENT_TIMEOUT=4h
 GATE_TIMEOUT=60m

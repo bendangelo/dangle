@@ -150,6 +150,8 @@ check "a model with a colon stays whole" '[ "$(res pi:ollama-local/qwen3.8:lates
 check "a bare model uses the default agent" '[ "$(res opus)" = "claude:opus|claude -p --dangerously-skip-permissions --model opus" ]'
 check "an alias" '[ "$(res local)" = "pi:ollama-local/qwen3.8:latest|pi -p --approve --model ollama-local/qwen3.8:latest" ]'
 check "extra arguments pass through" '[ "$(res "opencode --variant high")" = "opencode|opencode run --auto --variant high" ]'
+printf 'BASE=main\nPLANS=plans\n' > .dangle/config
+check "with no AGENT the default is Claude Code" '[ "$(res opus)" = "claude:opus|claude -p --dangerously-skip-permissions --model opus" ]'
 
 repo manual
 "$DANGLE" new feature > "$tmp/out" 2>&1

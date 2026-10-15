@@ -9,7 +9,7 @@
 set -u
 LC_ALL=C
 export LC_ALL
-VERSION=0.1.2
+VERSION=0.1.3
 
 # ---------------------------------------------------------------- output
 
@@ -91,11 +91,14 @@ load_config() {
     eval "CFG_$key=\$val"
   done < "$f"
 }
+# Claude Code when the config names no agent.
+DEFAULT_AGENT=claude
 
 # cfg KEY [default]
 cfg() {
   local v
   eval "v=\${CFG_$1-}"
+  [ -n "$v" ] || [ "$1" != AGENT ] || v=$DEFAULT_AGENT
   if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "${2-}"; fi
 }
 
@@ -157,7 +160,7 @@ preset() {
 }
 
 # resolve_agent <spec> <default spec>: sets AGENT_CMD (words) and AGENT_LABEL.
-# A spec is `name[:model] [extra args]`: a preset (pi, opencode, claude, codex), an
+# A spec is `name[:model] [extra args]`: a preset (claude, codex, opencode, pi), an
 # ALIAS_<name> from the config, a command of your own, or a bare model for the default agent.
 resolve_agent() {
   local spec="$1" fallback="${2-}" first rest name model n=0 alias
@@ -183,7 +186,7 @@ resolve_agent() {
     preset "$dname" >/dev/null || die "'$spec' is not an agent, and the default agent ($dname) is not a preset to give a model to"
     resolve_agent "$dname:$spec" ""
   else
-    die "unknown agent '$spec' (presets: pi, opencode, claude, codex; or an ALIAS_ in .dangle/config, or a command)"
+    die "unknown agent '$spec' (presets: claude, codex, opencode, pi; or an ALIAS_ in .dangle/config, or a command)"
   fi
 }
 
@@ -679,7 +682,7 @@ dangle: a carrot on a stick for your coding agent.
   dangle path <branch|id>       print a worktree's path:  cd "$(dangle path 865)"
 
 Run options:
-  -a, --agent SPEC      agent for this run: claude:haiku, pi:qwen3.8:latest, opencode,
+  -a, --agent SPEC      agent for this run: claude:haiku, codex, opencode, pi:<model>,
                         an ALIAS_ from .dangle/config, or a bare model for the default
       --fix-agent SPEC  agent for fix-ups after a failed gate (default: the agent)
       --rest            after the ids given, run every other active plan too
@@ -985,7 +988,7 @@ go test ./...'
   elif [ -f Makefile ] && grep -q '^test:' Makefile; then gate='make test'
   fi
   [ -f .env ] && copy=".env$copy"
-  for a in pi opencode claude codex; do command -v $a >/dev/null 2>&1 && { agent=$a; break; }; done
+  for a in claude codex opencode pi; do command -v $a >/dev/null 2>&1 && { agent=$a; break; }; done
   mkdir -p .dangle/hooks
   write_new .dangle/config <<EOF
 # dangle settings: KEY=value, one per line. Read, never run.
@@ -993,8 +996,9 @@ BASE=$BASE
 PLANS=$PLANS
 # Landed plans move here, inside PLANS.
 DONE=done
-# The agent: pi, opencode, claude or codex, with an optional :model (claude:haiku,
-# pi:ollama-local/qwen3.8:latest), or a command of your own that takes the prompt last.
+# The agent: claude (Claude Code, the default), codex, opencode or pi, with an optional
+# :model (claude:sonnet, codex:gpt-5, pi:ollama/qwen3), or a command of your own that takes
+# the prompt last.
 AGENT=$agent
 # FIX_AGENT=claude:sonnet
 # Fix-up runs after a failed gate (0 = none).
