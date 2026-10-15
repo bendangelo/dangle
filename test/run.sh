@@ -306,6 +306,30 @@ plan 020-b.md b.txt '<!-- dangle: depends=010 -->'
 check "private plans (ignored by git) run, land, and move to done/ on disk" '[ -f a.txt ] && [ -f b.txt ] && [ -f plans/done/010-a.md ] && [ -f plans/done/020-b.md ] && [ -z "$(git ls-files plans)" ]'
 check "a private plan lands without its plan file in the commit" '! git show --stat HEAD | grep -q "plans/"'
 
+repo hbstop
+plan 010-a.md a.txt
+commit
+printf 'BASE=main\nPLANS=plans\nAGENT=%s\nHEARTBEAT=300s\n' "$tmp/agent" > .dangle/config
+commit "long heartbeat"
+start=$(date +%s)
+"$DANGLE" -y 2>&1 | cat > "$tmp/out"
+check "the heartbeat stops with the plan (a pipe after dangle closes at once)" '[ $(( $(date +%s) - start )) -lt 60 ] && [ -f a.txt ]'
+
+repo tworunners
+plan 010-a.md a.txt
+plan 020-b.md b.txt
+plan 030-c.md c.txt '<!-- dangle: depends=010 -->'
+plan 040-d.md d.txt
+commit
+printf 'BASE=main\nPLANS=plans\nAGENT=%s\n' "$tmp/slow-agent" > .dangle/config
+commit "slow"
+"$DANGLE" -y > "$tmp/out1" 2>&1 & r1=$!
+sleep 1
+"$DANGLE" -y > "$tmp/out2" 2>&1 & r2=$!
+wait $r1; rc1=$?; wait $r2; rc2=$?
+check "two runners in two terminals: every plan lands exactly once" '[ $rc1 = 0 ] && [ $rc2 = 0 ] && [ -f a.txt ] && [ -f b.txt ] && [ -f c.txt ] && [ -f d.txt ] && [ "$(git log --format=%s main | grep -c "^Plan ")" = 4 ]'
+check "two runners: both did some of the work" 'grep -q " landed " "$tmp/out1" && grep -q " landed " "$tmp/out2"'
+
 echo
 echo "$pass passed, $failed failed"
 [ $failed = 0 ]

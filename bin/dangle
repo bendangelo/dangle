@@ -9,7 +9,7 @@
 set -u
 LC_ALL=C
 export LC_ALL
-VERSION=0.1.7
+VERSION=0.1.8
 
 # ---------------------------------------------------------------- output
 
@@ -231,8 +231,11 @@ heartbeat() {
   local what="$1" log="$2" start
   start=$(date +%s)
   (
-    trap 'exit 0' TERM
-    while sleep "$HB_SECS"; do
+    s=''
+    trap '[ -n "$s" ] && kill "$s" 2>/dev/null; exit 0' TERM
+    while :; do
+      sleep "$HB_SECS" & s=$!
+      wait "$s" || exit 0
       line=$(tail -n 40 "$log" 2>/dev/null | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/\r//g' | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-90)
       say "  ...    $what $(minutes "$start" "$(date +%s)")${line:+  │ $line}"
     done
@@ -347,6 +350,13 @@ sync_base() {
   fi
 }
 
+# synced: sync_base under the land lock, so two runners never move the base branch at once.
+synced() {
+  take_lock "$STATE/land.lock" "another runner's landing"
+  sync_base
+  drop_lock "$STATE/land.lock"
+}
+
 # ---------------------------------------------------------------- worktrees
 
 wt_path() { printf '%s/%s/%s' "$PRIMARY" "$WORKTREES" "$1"; }
@@ -453,7 +463,6 @@ landed_ids() {
   sha=$(git rev-parse -q --verify "refs/heads/$BASE") || return 0
   cache="$STATE/landed-$sha"
   if [ ! -f "$cache" ]; then
-    rm -f "$STATE"/landed-*
     git ls-tree --name-only "refs/heads/$BASE" -- "$PLANS/$DONE/" 2>/dev/null |
       sed -n 's|.*/||; s/\.md$//p' |
       sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}-//; s/^([0-9]+)(-.*)?$/\1/' > "$cache.$$" &&
@@ -657,7 +666,7 @@ land() {
   log="$STATE/logs/${id:-$branch}.gate.log"
   export_ctx "$path" "$branch"
 
-  sync_base
+  synced
   merge_base_in "$path" "$inter" || fail "conflicts with $BASE" || return 1
 
   # The plan moves to the done folder in the branch itself, so it lands with the work. A
@@ -683,7 +692,7 @@ land() {
     export DANGLE_T_gate_log DANGLE_T_gate_tail
     run_agent "$fix" "$path" "$STATE/logs/${id:-$branch}.log" "$(render "$(template fix-prompt.md "$DEFAULT_FIX_PROMPT")")"
     commit_leftovers "$path"
-    sync_base
+    synced
     merge_base_in "$path" "$inter" || fail "conflicts with $BASE" || return 1
   done
 
@@ -727,7 +736,7 @@ land() {
         drop_lock "$STATE/land.lock"; fail "the land hook failed (log $log)"; return 1
       fi
       drop_lock "$STATE/land.lock"
-      sync_base
+      synced
       [ -n "$plan" ] && [ "$PRIVATE" = 1 ] && done_on_disk "$plan"
       if [ -n "$plan" ] && ! is_landed "$id"; then
         # Handed off (a pull request still waiting for CI): skipped by later runs until it lands.
@@ -889,7 +898,8 @@ $f"
   printf '# dangle run %s\n\nagent %s, base %s\n\n' "$(date)" "$AGENT_LABEL" "$BASE" > "$summary"
   art_stick
   say "  dangle · $total plan(s) · agent $AGENT_LABEL · base $BASE"
-  sync_base
+  find "$STATE" -maxdepth 1 -name 'landed-*' -mtime +1 -exec rm -f {} + 2>/dev/null
+  synced
   tstart=$(date +%s)
 
   # Again and again: the first plan, in order, whose dependencies have landed. A plan that
@@ -906,7 +916,7 @@ $f"
         [ "$said" = "$waiting" ] || say "  waiting for$waiting: another dangle is running it"
         said=$waiting
         sleep "${DANGLE_POLL:-30}"
-        sync_base
+        synced
         continue
       fi
       for f in $pending; do
