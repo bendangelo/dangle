@@ -155,7 +155,7 @@ repo manual
 "$DANGLE" new feature > "$tmp/out" 2>&1
 cd .worktrees/feature && echo hi > hi.txt && git add -A && git commit -qm "add hi" && cd ../..
 "$DANGLE" land feature > "$tmp/out" 2>&1
-check "dangle new + dangle land by hand" '[ -f hi.txt ] && [ ! -d .worktrees/feature ] && git log -1 --format=%s | grep -q "^feature$"'
+check "dangle new + dangle land by hand" '[ -f hi.txt ] && [ ! -d .worktrees/feature ] && git log -1 --format=%s | grep -q "^add hi$"'
 "$DANGLE" new feature2 > "$tmp/out" 2>&1
 ( cd .worktrees/feature2 && env DANGLE=1 "$DANGLE" land ) > "$tmp/out" 2>&1
 check "an agent cannot land" 'grep -q "refused" "$tmp/out"'
@@ -221,6 +221,12 @@ commit
 check "dry run orders a plan after the later-numbered plan it needs" '[ "$(grep -o "^  0[0-9]0" "$tmp/out" | tr -d " " | tr "\n" " ")" = "020 010 030 " ]'
 "$DANGLE" -y > "$tmp/out" 2>&1
 check "a plan that needs a later-numbered one runs after it, the same night" '[ -f a.txt ] && [ -f b.txt ] && [ "$(git log --format=%s main | sed -n 3p)" = "Plan 020-first.md" ]'
+
+repo inside
+"$DANGLE" new fix-typo > "$tmp/out" 2>&1
+( cd .worktrees/fix-typo && echo typo > typo.txt && git add -A && git commit -qm "Fix the typo" && "$DANGLE" land ) > "$tmp/out" 2>&1; rc=$?
+check "dangle land from inside the worktree removes it and its branch" '[ $rc = 0 ] && [ ! -d .worktrees/fix-typo ] && [ -z "$(git branch --list fix-typo)" ]'
+check "a branch of one commit lands under that commit's subject" '[ "$(git log -1 --format=%s main)" = "Fix the typo" ]'
 
 echo
 echo "$pass passed, $failed failed"

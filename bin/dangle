@@ -9,7 +9,7 @@
 set -u
 LC_ALL=C
 export LC_ALL
-VERSION=0.1.1
+VERSION=0.1.2
 
 # ---------------------------------------------------------------- output
 
@@ -368,6 +368,8 @@ new_worktree() {
 remove_worktree() {
   local branch="$1" force="${2-}" path
   path=$(wt_path "$branch")
+  # The caller may be standing in the worktree that is about to go.
+  cd "$PRIMARY" || return 1
   if [ -d "$path" ]; then
     export_ctx "$path" "$branch"
     hook teardown "$path" || err "the teardown hook failed (going on)"
@@ -608,7 +610,13 @@ land() {
     if [ "$tree" = "$(git rev-parse "$new^{tree}")" ]; then
       drop_lock "$STATE/land.lock"; fail "nothing to land: the branch has no changes"; return 1
     fi
-    if [ -n "$plan" ]; then msg="$(plan_title "$path/$PLANS/$DONE/${plan##*/}")"; else msg=$branch; fi
+    if [ -n "$plan" ]; then
+      msg="$(plan_title "$path/$PLANS/$DONE/${plan##*/}")"
+    elif [ "$(git -C "$path" rev-list --no-merges --count "$new..HEAD")" = 1 ]; then
+      msg=$(git -C "$path" log --no-merges -1 --format=%s "$new..HEAD")
+    else
+      msg=$branch
+    fi
     [ -n "$msg" ] || msg=$branch
     {
       printf '%s\n\nLanded by dangle from %s.\n\n' "$msg" "$branch"
