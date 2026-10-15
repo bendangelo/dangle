@@ -52,8 +52,10 @@ dangle                   # run it
 ## Plans
 
 A plan is a Markdown file in the plans folder (`docs/superpowers/plans`, `docs/plans` or
-`plans`, or `PLANS=` in the config). Every `*.md` directly in it is active; filename order is
-run order; subfolders are inactive (`done/` holds landed plans, `hold/` parks one).
+`plans`, or `PLANS=` in the config). Every `*.md` directly in it is active; subfolders are
+inactive (`done/` holds landed plans, `hold/` parks one). dangle runs the first plan, in
+filename order, whose dependencies have landed, and again until none is left: filename order,
+except that a plan never runs before what it `depends=` on.
 
 ```markdown
 # Payroll: employee master file
@@ -66,7 +68,8 @@ Done when: `cargo test payroll_employee`
 
 - The id is the plan's number: `2026-10-14-865-name.md` and `865-name.md` are both `865`. A plan
   without a number goes by its name, and any unique part of a name works too.
-- `depends=` skips a plan until those plans have landed. `agent=` picks the agent for it.
+- `depends=` holds a plan back until those plans have landed (a dependency that fails holds it
+  for the night). `agent=` picks the agent for it.
 - `Done when:` is a command dangle runs after the gate; the plan lands only when it passes.
 - Keep plans small: one goal, one session, a few hundred lines at most (`dangle lint` warns).
   The skill from `dangle skill` tells your agents all of this, and how to tidy a repository's

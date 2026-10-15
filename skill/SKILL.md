@@ -9,7 +9,8 @@ description: >
 # Plans for dangle
 
 dangle runs every `*.md` file directly in the plans folder (`PLANS=` in `.dangle/config`;
-`dangle doctor` prints it), one at a time, in filename order. Each plan gets a fresh
+`dangle doctor` prints it), one at a time: the first plan in filename order whose
+dependencies have landed, again and again. Each plan gets a fresh
 worktree from the base branch, an agent implements it, the gate checks it, and only then
 does it land. Subfolders are inactive: `done/` holds landed plans, and any other subfolder
 (`hold/`, `drafts/`) parks a plan.
@@ -18,7 +19,7 @@ does it land. Subfolders are inactive: `done/` holds landed plans, and any other
 
 - **File name:** `NNN-short-name.md`, or with a date `YYYY-MM-DD-NNN-short-name.md`. The number
   is the id (`dangle 865`), and the order of the names is the run order. Use the next free
-  number; leave gaps when you might insert plans later.
+  number; leave gaps when you might insert plans later. `dangle --dry-run` prints the order.
 - **One goal.** A plan is one change a single agent session can finish: about 3 to 8 files.
   Two goals make two plans. Aim for 100 to 300 lines (`MAX_LINES`, warned by `dangle lint`).
 - **Header** (optional), on one line under the title:

@@ -212,6 +212,16 @@ commit "regate"
 "$DANGLE" -y > "$tmp/out" 2>&1
 check "base moved by docs only: lands without a second gate" '[ -f a.txt ] && [ -f docs/note.md ] && [ "$(wc -l < .gate-runs)" -eq 1 ]'
 
+repo outoforder
+plan 010-needs-later.md a.txt '<!-- dangle: depends=020 -->'
+plan 020-first.md b.txt
+plan 030-last.md c.txt
+commit
+"$DANGLE" -n > "$tmp/out" 2>&1
+check "dry run orders a plan after the later-numbered plan it needs" '[ "$(grep -o "^  0[0-9]0" "$tmp/out" | tr -d " " | tr "\n" " ")" = "020 010 030 " ]'
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "a plan that needs a later-numbered one runs after it, the same night" '[ -f a.txt ] && [ -f b.txt ] && [ "$(git log --format=%s main | sed -n 3p)" = "Plan 020-first.md" ]'
+
 echo
 echo "$pass passed, $failed failed"
 [ $failed = 0 ]

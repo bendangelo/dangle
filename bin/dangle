@@ -425,13 +425,24 @@ find_plan() {
   return 2
 }
 
-# unmet <file>: the dependencies of a plan that have not landed, one per line.
+# unmet <file> [ids taken as landed]: the dependencies of a plan that have not landed.
 unmet() {
   local d
   for d in $(plan_field "$1" depends | tr ',' ' '); do
+    case " ${2-} " in *" $d "*) continue ;; esac
     is_landed "$d" || printf '%s\n' "$d"
   done
 }
+
+# first_ready <files> [ids taken as landed]: the first plan, in order, whose dependencies landed.
+first_ready() {
+  local g
+  for g in $1; do
+    [ -z "$(unmet "$g" "${2-}")" ] && { printf '%s' "$g"; return 0; }
+  done
+  return 1
+}
+without() { printf '%s\n' "$1" | grep -Fxv -- "$2"; }
 
 # ---------------------------------------------------------------- prompts
 
@@ -675,6 +686,13 @@ Configuration: .dangle/config, .dangle/copy, .dangle/hooks/*, .dangle/prompt.md 
 EOF
 }
 
+# note_result <result>: one plan's line in its result file, the summary and the progress bar.
+note_result() {
+  printf '%s %s\n' "$(date '+%F %T')" "$1" > "$STATE/results/$id"
+  printf -- '- %s %s (%s): %s\n' "$id" "$1" "$(minutes "$t0" "$(date +%s)")" "$(plan_title "$f" 2>/dev/null)" >> "$summary"
+  say "  $(progress_bar "$n" "$total")  $n/$total  $id $1  $(minutes "$t0" "$(date +%s)")"
+}
+
 cmd_run() {
   local ids='' rest=0 dry=0 yes=0 agent='' fixagent='' f id queue='' total=0 n=0 landed=0 failed=0 skipped=0 \
     t0 t1 tstart spec path branch result fast=0 deps summary line
@@ -729,10 +747,17 @@ $f"
   total=$(printf '%s\n' "$queue" | wc -l | tr -d ' ')
 
   if [ $dry = 1 ]; then
-    say "dangle would run $total plan(s) from $PLANS onto $BASE:"
-    for f in $queue; do
-      deps=$(unmet "$f" | tr '\n' ' ')
-      printf '  %-8s %s%s\n' "$(plan_id "$f")" "$(plan_title "$f")" "${deps:+   (waits for $deps)}"
+    # The order a run would take if every plan landed: the first ready plan, again and again.
+    say "dangle would run $total plan(s) from $PLANS onto $BASE, in this order:"
+    local assumed='' pending=$queue
+    while f=$(first_ready "$pending" "$assumed"); do
+      printf '  %-8s %s\n' "$(plan_id "$f")" "$(plan_title "$f")"
+      assumed="$assumed $(plan_id "$f")"
+      pending=$(without "$pending" "$f")
+    done
+    for f in $pending; do
+      deps=$(unmet "$f" "$assumed" | tr '\n' ' ')
+      printf '  %-8s %s   (never: waits for %s, which is not active)\n' "$(plan_id "$f")" "$(plan_title "$f")" "${deps% }"
     done
     return 0
   fi
@@ -758,16 +783,27 @@ $f"
   sync_base
   tstart=$(date +%s)
 
-  for f in $queue; do
+  # Again and again: the first plan, in order, whose dependencies have landed. A plan that
+  # waits for one that failed is left for the end.
+  local pending=$queue
+  while [ -n "$pending" ]; do
+    if ! f=$(first_ready "$pending"); then
+      for f in $pending; do
+        n=$((n + 1)); id=$(plan_id "$f"); t0=$(date +%s); skipped=$((skipped + 1))
+        deps=$(unmet "$f" | tr '\n' ' ')
+        say ""
+        say "  $id  $(plan_title "$f")"
+        note_result "skipped  (waits for ${deps% })"
+      done
+      break
+    fi
+    pending=$(without "$pending" "$f")
     n=$((n + 1)); id=$(plan_id "$f"); branch="$PREFIX$id"; path=$(wt_path "$branch")
     say ""
     say "  $id  $(plan_title "$f")"
     t0=$(date +%s); result=
-    deps=$(unmet "$f" | tr '\n' ' ')
     if [ ! -f "$f" ]; then
       result="skipped  (landed by another run)"
-    elif [ -n "$deps" ]; then
-      result="skipped  (waits for ${deps% })"
     elif ! git cat-file -e "refs/heads/$BASE:$PLANS/${f##*/}" 2>/dev/null; then
       result="skipped  (not committed on $BASE)"
     elif [ -f "$STATE/submitted/$id" ] && [ -z "$ids" ]; then
@@ -816,9 +852,7 @@ $f"
       fi
       unclaim "$id"
     fi
-    printf '%s %s\n' "$(date '+%F %T')" "$result" > "$STATE/results/$id"
-    printf -- '- %s %s (%s): %s\n' "$id" "$result" "$(minutes "$t0" "$(date +%s)")" "$(plan_title "$f" 2>/dev/null)" >> "$summary"
-    say "  $(progress_bar $n "$total")  $n/$total  $id $result  $(minutes "$t0" "$(date +%s)")"
+    note_result "$result"
     if [ $fast -ge 2 ]; then
       say ""
       say "  stopping: the agent failed fast twice in a row (out of credit or usage? signed out? model down?)"
@@ -1012,7 +1046,8 @@ description: >
 # Plans for dangle
 
 dangle runs every `*.md` file directly in the plans folder (`PLANS=` in `.dangle/config`;
-`dangle doctor` prints it), one at a time, in filename order. Each plan gets a fresh
+`dangle doctor` prints it), one at a time: the first plan in filename order whose
+dependencies have landed, again and again. Each plan gets a fresh
 worktree from the base branch, an agent implements it, the gate checks it, and only then
 does it land. Subfolders are inactive: `done/` holds landed plans, and any other subfolder
 (`hold/`, `drafts/`) parks a plan.
@@ -1021,7 +1056,7 @@ does it land. Subfolders are inactive: `done/` holds landed plans, and any other
 
 - **File name:** `NNN-short-name.md`, or with a date `YYYY-MM-DD-NNN-short-name.md`. The number
   is the id (`dangle 865`), and the order of the names is the run order. Use the next free
-  number; leave gaps when you might insert plans later.
+  number; leave gaps when you might insert plans later. `dangle --dry-run` prints the order.
 - **One goal.** A plan is one change a single agent session can finish: about 3 to 8 files.
   Two goals make two plans. Aim for 100 to 300 lines (`MAX_LINES`, warned by `dangle lint`).
 - **Header** (optional), on one line under the title:
