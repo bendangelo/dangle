@@ -311,7 +311,7 @@ plan 010-a.md a.txt
 commit
 printf 'BASE=main\nPLANS=plans\nAGENT=%s\nHEARTBEAT=300s\n' "$tmp/agent" > .dangle/config
 commit "long heartbeat"
-start=$(date +%s)
+start=$(date +%s); export start
 "$DANGLE" -y 2>&1 | cat > "$tmp/out"
 check "the heartbeat stops with the plan (a pipe after dangle closes at once)" '[ $(( $(date +%s) - start )) -lt 60 ] && [ -f a.txt ]'
 
@@ -326,7 +326,7 @@ commit "slow"
 "$DANGLE" -y > "$tmp/out1" 2>&1 & r1=$!
 sleep 1
 "$DANGLE" -y > "$tmp/out2" 2>&1 & r2=$!
-wait $r1; rc1=$?; wait $r2; rc2=$?
+wait $r1; export rc1=$?; wait $r2; export rc2=$?
 check "two runners in two terminals: every plan lands exactly once" '[ $rc1 = 0 ] && [ $rc2 = 0 ] && [ -f a.txt ] && [ -f b.txt ] && [ -f c.txt ] && [ -f d.txt ] && [ "$(git log --format=%s main | grep -c "^Plan ")" = 4 ]'
 check "two runners: both did some of the work" 'grep -q " landed " "$tmp/out1" && grep -q " landed " "$tmp/out2"'
 
