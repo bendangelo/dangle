@@ -346,6 +346,50 @@ commit "json agent"
 DANGLE_TEST_AGENT="$tmp/agent" "$DANGLE" -y > "$tmp/out" 2>&1
 check "a JSON event stream becomes readable lines in the log and the heartbeat" 'grep -q "agent [0-9]*s  │ → bash cargo test -p widgets" "$tmp/out" && grep -q "^All done.$" .git/dangle/logs/010.log && [ -s .git/dangle/logs/010.jsonl ] && [ -f a.txt ]'
 
+
+repo pickup
+plan 010-a.md a.txt
+commit
+# While 010 runs, "you" commit plan 020 and leave 030 uncommitted in the main checkout.
+cat > "$tmp/writer-agent" <<'EOF2'
+#!/bin/sh
+if [ ! -f "$DANGLE_PRIMARY/plans/020-b.md" ]; then
+  ( cd "$DANGLE_PRIMARY" &&
+    printf '# Plan 020-b.md\n\nCreate: b.txt\n' > plans/020-b.md &&
+    printf '# Plan 030-c.md\n\nCreate: c.txt\n' > plans/030-c.md &&
+    git add plans/020-b.md && git commit -qm "plan 020" )
+fi
+exec "$DANGLE_TEST_AGENT" "$@"
+EOF2
+chmod +x "$tmp/writer-agent"
+printf 'BASE=main\nPLANS=plans\nAGENT=%s\n' "$tmp/writer-agent" > .dangle/config
+commit "writer agent"
+DANGLE_TEST_AGENT="$tmp/agent" "$DANGLE" -y > "$tmp/out" 2>&1; rc=$?
+check "a plan committed during the run is picked up and lands" '[ $rc = 0 ] && grep -q "picked up  020" "$tmp/out" && [ -f a.txt ] && [ -f b.txt ] && [ -f plans/done/020-b.md ]'
+check "an uncommitted plan is left alone" '! grep -q "030" "$tmp/out" && [ ! -f c.txt ] && [ -f plans/030-c.md ]'
+rm -f plans/030-c.md
+
+repo pickup-ids
+plan 010-a.md a.txt
+commit
+printf 'BASE=main\nPLANS=plans\nAGENT=%s\n' "$tmp/writer-agent" > .dangle/config
+commit "writer agent"
+DANGLE_TEST_AGENT="$tmp/agent" "$DANGLE" -y 010 > "$tmp/out" 2>&1; rc=$?
+check "a run of only the ids given picks up nothing" '[ $rc = 0 ] && [ -f a.txt ] && [ ! -f b.txt ] && ! grep -q "picked up" "$tmp/out"'
+rm -f plans/030-c.md
+"$DANGLE" -y 020 --watch > "$tmp/out" 2>&1; rc=$?
+check "--watch with ids needs --rest" '[ $rc != 0 ] && grep -q "add --rest" "$tmp/out"'
+
+repo watch
+plan 010-a.md a.txt
+commit
+DANGLE_POLL=1 "$DANGLE" -y --watch > "$tmp/out" 2>&1 & run=$!
+i=0; while [ $i -lt 60 ] && ! grep -q "watching plans" "$tmp/out"; do sleep 0.5; i=$((i + 1)); done
+plan 020-b.md b.txt
+commit "plan 020"
+i=0; while [ $i -lt 60 ] && ! grep -q "020 landed" "$tmp/out"; do sleep 0.5; i=$((i + 1)); done
+kill -TERM $run; wait $run; rc=$?
+check "--watch waits for a new plan, runs it, and ends on a signal with a summary" '[ $rc = 0 ] && grep -q "picked up  020" "$tmp/out" && grep -q "stopped watching" "$tmp/out" && [ -f b.txt ] && grep -q "2 landed" .git/dangle/last-run.md'
 echo
 echo "$pass passed, $failed failed"
 [ $failed = 0 ]

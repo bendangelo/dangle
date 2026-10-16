@@ -98,7 +98,15 @@ dangle -a claude:haiku         # pick the agent for this run
 dangle -a opus                 # the default agent with another model
 dangle status                  # ready, waiting, running, kept, submitted
 dangle 866                     # continue a failed plan in its kept worktree (--fresh: start over)
+dangle --watch                 # never run out: wait for new plans when the queue is empty
 ```
+
+A run of every active plan (no ids, or `--rest`) looks at the plans folder again before each
+plan: a plan you write and commit while dangle runs is **picked up** and joins the end of the
+queue (still never before what it `depends=` on). An uncommitted plan waits until you commit
+it; a private plan, until it has not changed for a minute. With `--watch`, an empty queue, or
+one blocked by a failed plan, waits for more (every `DANGLE_POLL` seconds, default 30) instead
+of ending the run; Ctrl-C ends it and writes the summary.
 
 While an agent or the gate runs, a line every 5 minutes says how long it has run and what it
 printed last (`HEARTBEAT=5m`, `0` turns it off):

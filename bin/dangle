@@ -9,7 +9,7 @@
 set -u
 LC_ALL=C
 export LC_ALL
-VERSION=0.1.9
+VERSION=0.1.10
 
 # ---------------------------------------------------------------- output
 
@@ -849,6 +849,7 @@ Run options:
       --rest            after the ids given, run every other active plan too
       --fresh           start a plan's worktree over instead of continuing a kept one
       --follow          show the agent's output as it runs
+      --watch           when the queue is empty, wait for new plans instead of ending
   -n, --dry-run         print what would run and stop
   -y, --yes             do not ask before starting
   -q, --quiet           no art
@@ -866,9 +867,45 @@ note_result() {
   say "  $(progress_bar "$n" "$total")  $n/$total  $id $1  $(minutes "$t0" "$(date +%s)")"
 }
 
+# pick_up: queues the active plans that appeared since the run started (cmd_run's pending,
+# known and total). A plan not yet committed on the base branch, or a private one changed in
+# the last minute, is left for the next look.
+pick_up() {
+  local g
+  for g in $(plan_files); do
+    case "$known
+" in *"
+$g
+"*) continue ;; esac
+    if [ "$PRIVATE" = 0 ]; then
+      git cat-file -e "refs/heads/$BASE:$PLANS/${g##*/}" 2>/dev/null || continue
+    else
+      [ -n "$(find "$g" -mmin +1 2>/dev/null)" ] || continue
+    fi
+    known="$known
+$g"
+    pending=$(printf '%s\n%s\n' "$pending" "$g" | sed '/^$/d')
+    total=$((total + 1))
+    say ""; say "  picked up  $(plan_id "$g")  $(plan_title "$g")"
+    printf -- '- %s picked up during the run: %s\n' "$(plan_id "$g")" "$(plan_title "$g")" >> "$summary"
+  done
+}
+
+# idle: one poll of --watch; 1 when Ctrl-C (or TERM) asks the run to end.
+idle() {
+  trap 'STOP=1' INT TERM
+  local s
+  sleep "${DANGLE_POLL:-30}" & s=$!
+  wait $s 2>/dev/null
+  kill $s 2>/dev/null
+  trap 'cleanup; exit 130' INT TERM
+  [ $STOP = 0 ] || { say ""; say "  stopped watching"; return 1; }
+  synced
+}
+
 cmd_run() {
   local ids='' rest=0 dry=0 yes=0 agent='' fixagent='' f id queue='' total=0 n=0 landed=0 failed=0 skipped=0 \
-    t0 t1 tstart spec path branch result fast=0 deps summary line
+    t0 t1 tstart spec path branch result fast=0 deps summary line watch=0 rescan=0 known STOP=0
   FRESH=0 FOLLOW=0
   while [ $# -gt 0 ]; do
     case $1 in
@@ -879,6 +916,7 @@ cmd_run() {
       --rest) rest=1 ;;
       --fresh) FRESH=1 ;;
       --follow) FOLLOW=1 ;;
+      --watch) watch=1 ;;
       -n|--dry-run) dry=1 ;;
       -y|--yes) yes=1 ;;
       -q|--quiet) QUIET=1 ;;
@@ -898,6 +936,9 @@ cmd_run() {
     exit 1
   fi
   [ $dry = 1 ] || require_clean_base
+  # A run of every active plan (no ids, or --rest) looks for new plans before each one.
+  if [ -z "$ids" ] || [ $rest = 1 ]; then rescan=1; fi
+  [ $watch = 0 ] || [ $rescan = 1 ] || die "--watch waits for new active plans; with ids, add --rest"
 
   # The queue: the ids given, in that order (then the rest with --rest), or every active plan.
   for id in $ids; do
@@ -916,8 +957,9 @@ $f"
     done
   fi
   queue=$(printf '%s\n' "$queue" | sed '/^$/d')
-  [ -n "$queue" ] || { say "dangle: no active plans in $PLANS"; return 0; }
-  total=$(printf '%s\n' "$queue" | wc -l | tr -d ' ')
+  [ -n "$queue" ] || [ $watch = 1 ] || { say "dangle: no active plans in $PLANS"; return 0; }
+  total=$(printf '%s\n' "$queue" | sed '/^$/d' | wc -l | tr -d ' ')
+  known=$queue
 
   if [ $dry = 1 ]; then
     # The order a run would take if every plan landed: the first ready plan, again and again.
@@ -937,7 +979,7 @@ $f"
 
   resolve_agent "${agent:-$(cfg AGENT)}" "$(cfg AGENT)"
   if [ $yes = 0 ] && [ -t 0 ] && [ -t 1 ]; then
-    printf 'Run %s plan(s) with %s onto %s? [Y/n] ' "$total" "$AGENT_LABEL" "$BASE"
+    printf 'Run %s plan(s)%s with %s onto %s? [Y/n] ' "$total" "$([ $watch = 1 ] && printf ' and watch for more')" "$AGENT_LABEL" "$BASE"
     read -r line || line=n
     case $line in ''|y|Y|yes) ;; *) return 0 ;; esac
   fi
@@ -952,7 +994,7 @@ $f"
   summary="$STATE/last-run.md"
   printf '# dangle run %s\n\nagent %s, base %s\n\n' "$(date)" "$AGENT_LABEL" "$BASE" > "$summary"
   art_stick
-  say "  dangle · $total plan(s) · agent $AGENT_LABEL · base $BASE"
+  say "  dangle · $total plan(s)$([ $watch = 1 ] && printf ', watching for more') · agent $AGENT_LABEL · base $BASE"
   find "$STATE" -maxdepth 1 -name 'landed-*' -mtime +1 -exec rm -f {} + 2>/dev/null
   synced
   tstart=$(date +%s)
@@ -960,8 +1002,18 @@ $f"
   # Again and again: the first plan, in order, whose dependencies have landed. A plan that
   # waits for one that failed is left for the end. A plan that waits for one another dangle
   # is running (a second terminal) waits for it to land.
+  # A plan written (and, unless the plans are private, committed) while dangle runs joins the
+  # queue at its end. With --watch an empty or blocked queue waits for more instead of ending.
   local pending=$queue waiting said=''
-  while [ -n "$pending" ]; do
+  while :; do
+    [ $rescan = 0 ] || pick_up
+    if [ -z "$pending" ]; then
+      [ $watch = 1 ] || break
+      [ "$said" = idle ] || { say ""; say "  watching $PLANS for new plans (Ctrl-C ends the run)"; }
+      said=idle
+      idle || break
+      continue
+    fi
     if ! f=$(first_ready "$pending"); then
       waiting=''
       for f in $pending; do
@@ -974,6 +1026,15 @@ $f"
         synced
         continue
       fi
+      if [ $watch = 1 ]; then
+        # Blocked by a plan that failed or is not active: it may still land (dangle 866 in
+        # another terminal), so keep watching.
+        waiting=$(for f in $pending; do unmet "$f"; done | sort -u | tr '\n' ' ')
+        [ "$said" = "blocked $waiting" ] || { say ""; say "  watching: $(printf '%s\n' "$pending" | wc -l | tr -d ' ') plan(s) wait for ${waiting% }, which has not landed"; }
+        said="blocked $waiting"
+        idle || break
+        continue
+      fi
       for f in $pending; do
         n=$((n + 1)); id=$(plan_id "$f"); t0=$(date +%s); skipped=$((skipped + 1))
         deps=$(unmet "$f" | tr '\n' ' ')
@@ -983,7 +1044,7 @@ $f"
       done
       break
     fi
-    pending=$(without "$pending" "$f")
+    pending=$(without "$pending" "$f"); said=''
     n=$((n + 1)); id=$(plan_id "$f"); branch="$PREFIX$id"; path=$(wt_path "$branch")
     say ""
     say "  $id  $(plan_title "$f")"
