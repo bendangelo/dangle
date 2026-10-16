@@ -873,7 +873,8 @@ note_result() {
 pick_up() {
   local g
   for g in $(plan_files); do
-    case "$known
+    case "
+$known
 " in *"
 $g
 "*) continue ;; esac

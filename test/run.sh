@@ -365,8 +365,8 @@ chmod +x "$tmp/writer-agent"
 printf 'BASE=main\nPLANS=plans\nAGENT=%s\n' "$tmp/writer-agent" > .dangle/config
 commit "writer agent"
 DANGLE_TEST_AGENT="$tmp/agent" "$DANGLE" -y > "$tmp/out" 2>&1; rc=$?
-check "a plan committed during the run is picked up and lands" '[ $rc = 0 ] && grep -q "picked up  020" "$tmp/out" && [ -f a.txt ] && [ -f b.txt ] && [ -f plans/done/020-b.md ]'
-check "an uncommitted plan is left alone" '! grep -q "030" "$tmp/out" && [ ! -f c.txt ] && [ -f plans/030-c.md ]'
+check "a plan committed during the run is picked up and lands" '[ $rc = 0 ] && grep -q "picked up  020" "$tmp/out" && ! grep -q "picked up  010" "$tmp/out" && grep -q " 2/2  020 landed" "$tmp/out" && [ -f a.txt ] && [ -f b.txt ] && [ -f plans/done/020-b.md ]'
+check "an uncommitted plan is left alone" '! grep -q " 030 " "$tmp/out" && [ ! -f c.txt ] && [ -f plans/030-c.md ]'
 rm -f plans/030-c.md
 
 repo pickup-ids
