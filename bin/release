@@ -1,0 +1,42 @@
+#!/bin/sh
+# Releases dangle: tags the version in bin/dangle and pushes main and the tag. The release
+# job in .github/workflows/test.yml builds the tarball and the GitHub release from the tag.
+#
+#   bin/release            release the VERSION already in bin/dangle
+#   bin/release 0.1.11     set VERSION to 0.1.11, commit it, then release it
+set -eu
+cd "$(dirname "$0")/.."
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'release: %s\n' "$*" >&2; exit 1; }
+
+current() { sed -n 's/^VERSION=//p' bin/dangle; }
+
+[ "$(git rev-parse --abbrev-ref HEAD)" = main ] || die "not on main"
+[ -z "$(git status --porcelain)" ] || die "the working tree has changes; commit or stash them"
+
+version=${1:-$(current)}
+case $version in
+  [0-9]*.[0-9]*.[0-9]*) ;;
+  *) die "not a version: $version (want X.Y.Z)" ;;
+esac
+tag=v$version
+git rev-parse -q --verify "refs/tags/$tag" >/dev/null && die "$tag is already tagged"
+
+git fetch -q origin main
+[ -z "$(git rev-list HEAD..origin/main)" ] || die "origin/main has commits main lacks; pull first"
+
+test/run.sh || die "tests failed; nothing tagged"
+
+if [ "$version" != "$(current)" ]; then
+  sed "s/^VERSION=.*/VERSION=$version/" bin/dangle >bin/dangle.tmp
+  cat bin/dangle.tmp >bin/dangle && rm bin/dangle.tmp
+  [ "$(bin/dangle --version)" = "dangle $version" ] ||
+    die "bin/dangle --version says $(bin/dangle --version) after the bump"
+  git commit -q -m "dangle $version" bin/dangle
+  say "committed dangle $version"
+fi
+
+git tag "$tag"
+git push origin main "$tag"
+say "pushed $tag; CI publishes the release once the tests pass"
