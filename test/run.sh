@@ -44,6 +44,11 @@ if grep -q '^Agent: race' "$plan"; then
   git -C "$DANGLE_PRIMARY" commit -qam race && git -C "$DANGLE_PRIMARY" push -q origin main
   echo plan-edit > README
 fi
+if grep -q '^Agent: twice' "$plan"; then
+  printf 'base\nbase-line\nend\nsame-line\n' > "$DANGLE_PRIMARY/README"
+  git -C "$DANGLE_PRIMARY" commit -qam race && git -C "$DANGLE_PRIMARY" push -q origin main
+  printf 'base\nsame-line\nend\n' > README
+fi
 if grep -q '^Agent: append' "$plan"; then
   printf 'base\nbase-line\nend\n' > "$DANGLE_PRIMARY/README"
   git -C "$DANGLE_PRIMARY" commit -qam race && git -C "$DANGLE_PRIMARY" push -q origin main
@@ -216,6 +221,13 @@ printf 'base\nend\n' > README
 commit
 "$DANGLE" -y > "$tmp/out" 2>&1
 check "both sides adding lines at one place is settled: the base's lines, then the plan's" '[ -f a.txt ] && [ "$(cat README)" = "$(printf "base\nbase-line\nplan-line\nend")" ] && grep -q "settled 1 conflict" "$tmp/out" && ! grep -q "resolves them" "$tmp/out"'
+
+repo twice
+plan 010-twice.md a.txt 'Agent: twice'
+printf 'base\nend\n' > README
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "a line both sides added is not kept twice: the agent resolves it" '! grep -q "settled" "$tmp/out" && grep -q "the agent resolves them" "$tmp/out"'
 
 repo mergeagent
 plan 010-race.md a.txt 'Agent: race'

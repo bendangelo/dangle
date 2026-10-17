@@ -711,26 +711,33 @@ done_on_disk() {
 # settle_added <worktree>: in a conflicted merge, settles the conflicts where both sides only
 # added lines at the same place (two plans appending to one list, match or doc section): the
 # base's lines first, as they landed first, then the branch's. The gate still runs after. Any
-# other conflict (a line both sides changed, a deleted file) leaves the merge for an agent or you.
+# other conflict (a line both sides changed, a deleted file) leaves the merge for an agent or you,
+# and so does a branch line the base branch also added to that file: both plans added the same
+# entry, and keeping both sides would list it twice.
 settle_added() {
-  local dir="$1" files f n=0 total=0
+  local dir="$1" files f n=0 total=0 sides="$STATE/settle.$$"
   files=$(git -C "$dir" diff --name-only --diff-filter=U)
   [ -n "$files" ] || return 1
   while IFS= read -r f; do
     # A content conflict has all three stages; add/add, delete/modify and the like do not.
     [ "$(git -C "$dir" ls-files -u -- "$f" | wc -l)" -eq 3 ] || return 1
     git -C "$dir" checkout -q --conflict=diff3 -- "$f" 2>/dev/null || return 1
+    git -C "$dir" show ":1:$f" > "$sides.1" && git -C "$dir" show ":3:$f" > "$sides.3" || return 1
     n=$(awk '
+      FILENAME == f1 { before[$0] = 1; next }
+      FILENAME == f3 { landed[$0] = 1; next }
       /^<<<<<<< / && s == 0 { s = 1; ours = ""; theirs = ""; next }
       /^\|\|\|\|\|\|\| / && s == 1 { s = 2; next }
       /^=======$/ && s == 2 { s = 3; next }
       /^>>>>>>> / && s == 3 { printf "%s%s", theirs, ours > out; s = 0; n++; next }
-      s == 1 { ours = ours $0 "\n"; next }
+      s == 1 { ours = ours $0 "\n"; if ($0 ~ /[^ \t]/ && ($0 in landed) && !($0 in before)) bad = 1; next }
       s == 2 { bad = 1; next }
       s == 3 { theirs = theirs $0 "\n"; next }
       { print > out }
-      END { if (bad || s || !n) exit 1; print n }' out="$dir/$f.dangle-settled" "$dir/$f") ||
-      { rm -f "$dir/$f.dangle-settled"; return 1; }
+      END { if (bad || s || !n) exit 1; print n }' \
+      f1="$sides.1" f3="$sides.3" out="$dir/$f.dangle-settled" "$sides.1" "$sides.3" "$dir/$f") ||
+      { rm -f "$dir/$f.dangle-settled" "$sides.1" "$sides.3"; return 1; }
+    rm -f "$sides.1" "$sides.3"
     total=$((total + n))
   done <<FILES
 $files

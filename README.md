@@ -129,7 +129,8 @@ base branch and pushes it. A plan that fails keeps its worktree for you to look 
 
 A merge of the base branch that conflicts does not end the plan. Where both sides only added
 lines at the same place (two plans adding to one list, `match` or doc section), dangle keeps
-both, the base's lines first, and the gate checks the result. Any other conflict goes to the
+both, the base's lines first, and the gate checks the result (unless the base also added one of
+the branch's lines to that file, which would list it twice). Any other conflict goes to the
 agent with `merge-prompt.md`, which spends one of the `FIXES`; it counts only when the merge is
 committed with no conflict marker left, and is undone otherwise. A conflict found while landing
 lets go of the lock first, so no other landing waits on the agent, and the gate runs again
