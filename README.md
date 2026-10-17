@@ -37,7 +37,7 @@ run them overnight. It also works with plans from anywhere else: they are just M
 ## Install
 
 ```sh
-mise use -g github:bendangelo/dangle@0.1.10
+mise use -g github:bendangelo/dangle@0.1.11
 # (plain `github:bendangelo/dangle` works too, once a release is a day old: mise's
 #  minimum_release_age)
 # or
