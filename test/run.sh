@@ -28,10 +28,27 @@ case $prompt in *"read-only check"*)
 esac
 plan=$(printf '%s\n' "$prompt" | sed -n 's/.*plan in \([^ ,]*\.md\).*/\1/p' | head -n 1)
 case $prompt in *"The gate failed"*) rm -f BAD; git add -A; git commit -qm "fix: remove BAD"; exit 0 ;; esac
+# The merge prompt: "Agent: race" resolves the conflict, "Agent: race-bad" commits the markers.
+case $prompt in *"stopped on"*)
+  grep -q '^Agent: race-bad' "$plan" || echo resolved > README
+  git add -A && git commit -q --no-edit; exit 0 ;;
+esac
 grep -q '^Agent: idle' "$plan" && exit 0
 f=$(sed -n 's/^Create: //p' "$plan")
 echo "made by $DANGLE_PLAN with ${DANGLE_MODEL:-?}" > "$f"
 grep -q '^Agent: broken' "$plan" && touch BAD
+# "Agent: race" lands a change to README on the base branch while the plan runs, then edits the
+# same line; "Agent: append" adds a line where the base branch also adds one.
+if grep -q '^Agent: race' "$plan"; then
+  echo base-edit > "$DANGLE_PRIMARY/README"
+  git -C "$DANGLE_PRIMARY" commit -qam race && git -C "$DANGLE_PRIMARY" push -q origin main
+  echo plan-edit > README
+fi
+if grep -q '^Agent: append' "$plan"; then
+  printf 'base\nbase-line\nend\n' > "$DANGLE_PRIMARY/README"
+  git -C "$DANGLE_PRIMARY" commit -qam race && git -C "$DANGLE_PRIMARY" push -q origin main
+  printf 'base\nplan-line\nend\n' > README
+fi
 git add -A && git commit -qm "implement $DANGLE_PLAN"
 EOF
 chmod +x "$tmp/agent"
@@ -192,6 +209,39 @@ repo conflict
 echo ours > README && commit "base edit"
 "$DANGLE" land side > "$tmp/out" 2>&1; export rc=$?
 check "a conflict with the base stops the landing" '[ $rc = 1 ] && grep -q "conflicts" "$tmp/out" && [ "$(cat README)" = ours ]'
+
+repo settle
+plan 010-append.md a.txt 'Agent: append'
+printf 'base\nend\n' > README
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "both sides adding lines at one place is settled: the base's lines, then the plan's" '[ -f a.txt ] && [ "$(cat README)" = "$(printf "base\nbase-line\nplan-line\nend")" ] && grep -q "settled 1 conflict" "$tmp/out" && ! grep -q "resolves them" "$tmp/out"'
+
+repo mergeagent
+plan 010-race.md a.txt 'Agent: race'
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "any other conflict goes to the agent, and the plan lands" '[ -f a.txt ] && [ "$(cat README)" = resolved ] && grep -q "the agent resolves them" "$tmp/out" && grep -q "1 landed" "$tmp/out"'
+
+repo mergebad
+plan 010-race.md a.txt 'Agent: race-bad'
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "an agent merge that leaves conflict markers fails and is undone" '[ ! -f a.txt ] && grep -q "conflicts with main" "$tmp/out" && [ "$(cat .worktrees/plan-010/README)" = plan-edit ] && ! git -C .worktrees/plan-010 rev-parse -q --verify MERGE_HEAD >/dev/null'
+
+repo locked
+plan 010-readme.md README
+commit
+# The first gate lands a change to README on the base branch, as another runner would.
+cat > .dangle/hooks/gate <<EOF
+#!/bin/sh
+[ -e "$tmp/raced" ] && exit 0
+touch "$tmp/raced"
+cd "\$DANGLE_PRIMARY" && echo base-edit > README && git commit -qam race && git push -q origin main
+EOF
+commit "gate"
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "a conflict found under the land lock: the lock is let go, the agent resolves, the gate runs again" '[ "$(cat README)" = resolved ] && grep -q "gate   running after the merge" "$tmp/out" && grep -q "1 landed" "$tmp/out" && [ ! -d .git/dangle/land.lock ]'
 
 repo claims
 plan 010-a.md a.txt

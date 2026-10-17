@@ -601,6 +601,15 @@ Do not merge, push, or edit the plan file.
 
 {{gate_tail}}'
 
+DEFAULT_MERGE_PROMPT='Merging {{base}} into branch {{branch}}, which implements the plan in {{plan}}, stopped on
+conflicts. The merge is in progress in this worktree (see git status); the conflicted files are:
+{{conflicts}}
+
+Resolve every conflict so both sides'"'"' work survives. {{base}} has already landed, so its names
+and shapes win: adapt this branch'"'"'s side to them. Then git add the files and finish the merge with
+git commit --no-edit, and run the gate to check: {{gate}}
+Do not abort the merge, rebase, push, or edit the plan file.'
+
 DEFAULT_AUDIT_PROMPT='Do not change, create or delete any file, and do not commit: this is a read-only check.
 
 Read the implementation plan in {{plan}}. Then look at this repository'"'"'s code, tests and git log
@@ -699,30 +708,100 @@ done_on_disk() {
   mkdir -p "$PRIMARY/$PLANS/$DONE" && mv "$PRIMARY/$PLANS/${1##*/}" "$PRIMARY/$PLANS/$DONE/"
 }
 
-# merge_base_in <worktree> <interactive>: merges the base branch into the worktree's branch.
+# settle_added <worktree>: in a conflicted merge, settles the conflicts where both sides only
+# added lines at the same place (two plans appending to one list, match or doc section): the
+# base's lines first, as they landed first, then the branch's. The gate still runs after. Any
+# other conflict (a line both sides changed, a deleted file) leaves the merge for an agent or you.
+settle_added() {
+  local dir="$1" files f n=0 total=0
+  files=$(git -C "$dir" diff --name-only --diff-filter=U)
+  [ -n "$files" ] || return 1
+  while IFS= read -r f; do
+    # A content conflict has all three stages; add/add, delete/modify and the like do not.
+    [ "$(git -C "$dir" ls-files -u -- "$f" | wc -l)" -eq 3 ] || return 1
+    git -C "$dir" checkout -q --conflict=diff3 -- "$f" 2>/dev/null || return 1
+    n=$(awk '
+      /^<<<<<<< / && s == 0 { s = 1; ours = ""; theirs = ""; next }
+      /^\|\|\|\|\|\|\| / && s == 1 { s = 2; next }
+      /^=======$/ && s == 2 { s = 3; next }
+      /^>>>>>>> / && s == 3 { printf "%s%s", theirs, ours > out; s = 0; n++; next }
+      s == 1 { ours = ours $0 "\n"; next }
+      s == 2 { bad = 1; next }
+      s == 3 { theirs = theirs $0 "\n"; next }
+      { print > out }
+      END { if (bad || s || !n) exit 1; print n }' out="$dir/$f.dangle-settled" "$dir/$f") ||
+      { rm -f "$dir/$f.dangle-settled"; return 1; }
+    total=$((total + n))
+  done <<FILES
+$files
+FILES
+  printf '%s\n' "$files" | while IFS= read -r f; do mv "$dir/$f.dangle-settled" "$dir/$f"; done
+  printf '%s\n' "$files" | (cd "$dir" && while IFS= read -r f; do git add -- "$f"; done)
+  [ -z "$(git -C "$dir" diff --name-only --diff-filter=U)" ] &&
+    git -C "$dir" commit -q --no-edit || return 1
+  say "  merge  settled $total conflict(s) where both sides added lines: $(printf '%s' "$files" | tr '\n' ' ')"
+}
+
+# merge_by_agent <worktree> <agent spec> <log> <commit before the merge>: the agent resolves the
+# merge in progress. It counts only when the merge is committed with no conflict marker left.
+merge_by_agent() {
+  local dir="$1" before="$4"
+  DANGLE_T_conflicts=$(git -C "$dir" diff --name-only --diff-filter=U | sed 's/^/- /')
+  DANGLE_T_base=$BASE; export DANGLE_T_conflicts DANGLE_T_base
+  say "  merge  conflicts with $BASE; the agent resolves them"
+  run_agent "$2" "$dir" "$3" "$(render "$(template merge-prompt.md "$DEFAULT_MERGE_PROMPT")")"
+  [ -z "$(git -C "$dir" diff --name-only --diff-filter=U)" ] || return 1
+  if git -C "$dir" rev-parse -q --verify MERGE_HEAD >/dev/null; then
+    git -C "$dir" add -A && git -C "$dir" commit -q --no-edit || return 1
+  fi
+  commit_leftovers "$dir"
+  git merge-base --is-ancestor "refs/heads/$BASE" "$(git -C "$dir" rev-parse HEAD)" || return 1
+  ! git -C "$dir" diff --check "$before" HEAD 2>/dev/null | grep -q 'leftover conflict marker'
+}
+
+# merge_base_in <worktree> <interactive> [agent spec] [log]: merges the base branch into the
+# worktree's branch. A conflict where both sides added lines is settled by itself; any other one
+# goes to the agent, when one is given, or stops (by hand: with the merge left for you).
+# MERGED_BY says who settled it: empty (a clean merge), auto or agent.
+MERGED_BY=
 merge_base_in() {
-  git -C "$1" merge -q --no-edit "refs/heads/$BASE" >/dev/null 2>&1 && return 0
+  local dir="$1" before
+  MERGED_BY=
+  before=$(git -C "$dir" rev-parse HEAD)
+  git -C "$dir" merge -q --no-edit "refs/heads/$BASE" >/dev/null 2>&1 && return 0
+  if settle_added "$dir"; then MERGED_BY=auto; return 0; fi
   if [ "${2-}" = 1 ]; then
     err "the merge of $BASE into $1 conflicts: resolve it there, commit, and run dangle land again"
-  else
-    git -C "$1" merge --abort 2>/dev/null
+    return 1
   fi
+  if [ -n "${3-}" ] && merge_by_agent "$dir" "$3" "$4" "$before"; then MERGED_BY=agent; return 0; fi
+  git -C "$dir" merge --abort 2>/dev/null
+  git -C "$dir" reset -q --hard "$before"
   return 1
+}
+
+# merge_spending_fixes: land()'s merge of the base branch; an agent resolving a conflict spends
+# one of the FIXES fix-ups. Reads and sets land()'s locals (path, inter, fix, alog, fixes).
+merge_spending_fixes() {
+  local spare=''
+  [ "$fixes" -lt "$FIXES" ] && spare=$fix
+  merge_base_in "$path" "$inter" "$spare" "$alog" || { fail "conflicts with $BASE"; return 1; }
+  [ "$MERGED_BY" != agent ] || fixes=$((fixes + 1))
 }
 
 # land <branch> <plan file or empty> <fix spec or empty> <interactive> [keep]
 land() {
-  local branch="$1" plan="$2" fix="$3" inter="$4" keep="${5-}" path id log fixes=0 tries=0 old new tree sha msg
+  local branch="$1" plan="$2" fix="$3" inter="$4" keep="${5-}" path id log alog fixes=0 tries=0 old new tree sha msg
   path=$(wt_path "$branch")
   [ -d "$path" ] || fail "no worktree at $path" || return 1
   [ -z "$(git -C "$path" status --porcelain --untracked-files=no)" ] ||
     fail "$path has uncommitted changes" || return 1
   id=${plan:+$(plan_id "$plan")}
-  log="$STATE/logs/${id:-$branch}.gate.log"
+  log="$STATE/logs/${id:-$branch}.gate.log" alog="$STATE/logs/${id:-$branch}.log"
   export_ctx "$path" "$branch"
 
   synced
-  merge_base_in "$path" "$inter" || fail "conflicts with $BASE" || return 1
+  merge_spending_fixes || return 1
 
   # The plan moves to the done folder in the branch itself, so it lands with the work. A
   # private plan (ignored by git) moves on disk once the branch has landed.
@@ -745,10 +824,10 @@ land() {
     say "  gate   failed; fix-up $fixes of $FIXES"
     DANGLE_T_gate_log=$log DANGLE_T_gate_tail=$(tail -n 80 "$log")
     export DANGLE_T_gate_log DANGLE_T_gate_tail
-    run_agent "$fix" "$path" "$STATE/logs/${id:-$branch}.log" "$(render "$(template fix-prompt.md "$DEFAULT_FIX_PROMPT")")"
+    run_agent "$fix" "$path" "$alog" "$(render "$(template fix-prompt.md "$DEFAULT_FIX_PROMPT")")"
     commit_leftovers "$path"
     synced
-    merge_base_in "$path" "$inter" || fail "conflicts with $BASE" || return 1
+    merge_spending_fixes || return 1
   done
 
   take_lock "$STATE/land.lock" "another landing"
@@ -759,8 +838,18 @@ land() {
     new=$(git rev-parse "refs/heads/$BASE")
     if ! git merge-base --is-ancestor "$new" "$(git -C "$path" rev-parse HEAD)"; then
       old=$(git merge-base "$new" "$(git -C "$path" rev-parse HEAD)")
-      merge_base_in "$path" "$inter" || { drop_lock "$STATE/land.lock"; fail "conflicts with $BASE"; return 1; }
-      if regate_needed "$old" "$new"; then
+      if ! merge_base_in "$path" "$inter"; then
+        # No agent runs under the lock, which would hold up every other landing: let go, have
+        # it resolve the merge and gate the result, then take the lock again.
+        drop_lock "$STATE/land.lock"
+        [ "$inter" != 1 ] || { fail "conflicts with $BASE"; return 1; }
+        merge_spending_fixes || return 1
+        say "  gate   running after the merge"
+        run_gate "$path" "$log" "$wplan" || { fail "the gate failed after the merge with $BASE (log $log)"; return 1; }
+        take_lock "$STATE/land.lock" "another landing"
+        continue
+      fi
+      if [ -n "$MERGED_BY" ] || regate_needed "$old" "$new"; then
         say "  gate   $BASE moved; gating again"
         run_gate "$path" "$log" "$wplan" ||
           { drop_lock "$STATE/land.lock"; fail "the gate failed after $BASE moved (log $log)"; return 1; }
