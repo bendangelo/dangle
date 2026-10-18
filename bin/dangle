@@ -1178,7 +1178,7 @@ $f"
     n=$((n + 1)); id=$(plan_id "$f"); branch="$PREFIX$id"; path=$(wt_path "$branch")
     say ""
     say "  $id  $(plan_title "$f")"
-    t0=$(date +%s); result= t1=
+    t0=$(date +%s); result='' t1=''
     if [ ! -f "$f" ]; then
       result="skipped  (landed by another run)"
     elif [ "$PRIVATE" = 0 ] && ! git cat-file -e "refs/heads/$BASE:$PLANS/${f##*/}" 2>/dev/null; then
