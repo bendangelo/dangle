@@ -366,11 +366,21 @@ require_clean_base() {
 }
 
 # advance_base <new sha> <old sha>: moves the base branch forward, and its checkout with it.
+# Commits made on the base branch since <old sha> (plans, notes committed while the gate ran)
+# are rebased onto <new sha>, as sync_base does with commits that are not pushed yet.
 advance_base() {
-  local bw
+  local bw head
   bw=$(base_checkout)
   if [ -n "$bw" ]; then
-    git -C "$bw" merge -q --ff-only "$1" || die "could not fast-forward $BASE in $bw"
+    git -C "$bw" merge -q --ff-only "$1" 2>/dev/null && return 0
+    head=$(git -C "$bw" rev-parse HEAD)
+    git merge-base --is-ancestor "$2" "$head" ||
+      die "could not fast-forward $BASE in $bw to $(git rev-parse --short "$1")"
+    git -C "$bw" rebase -q --autostash --onto "$1" "$2" >/dev/null 2>&1 || {
+      git -C "$bw" rebase --abort 2>/dev/null
+      die "$BASE in $bw got commits while landing that do not rebase onto $(git rev-parse --short "$1"); rebase $BASE onto it by hand"
+    }
+    say "  land   rebased $(git -C "$bw" rev-list --count "$1..HEAD") commit(s) made on $BASE meanwhile"
   else
     git update-ref "refs/heads/$BASE" "$1" "$2" || die "could not move $BASE"
   fi
@@ -901,6 +911,11 @@ land() {
     fi
     sha=$(git commit-tree "$tree" -p "$new" < "$STATE/message") ||
       { drop_lock "$STATE/land.lock"; fail "could not squash"; return 1; }
+    # Someone committed on the base branch while the gate ran: take that in before pushing.
+    if [ "$(git rev-parse "refs/heads/$BASE")" != "$new" ]; then
+      say "  land   $BASE got a commit during the landing; syncing again"
+      continue
+    fi
     if [ -n "$REMOTE" ] && ! git push -q "$REMOTE" "$sha:refs/heads/$BASE" 2>/dev/null; then
       say "  land   $REMOTE/$BASE moved during the landing; syncing again"
       continue

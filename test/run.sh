@@ -283,6 +283,25 @@ commit "regate"
 "$DANGLE" -y > "$tmp/out" 2>&1
 check "base moved by docs only: lands without a second gate" '[ -f a.txt ] && [ -f docs/note.md ] && [ "$(wc -l < .gate-runs)" -eq 1 ]'
 
+repo localcommit
+plan 010-a.md a.txt
+cat > .dangle/hooks/gate <<'EOF2'
+#!/bin/sh
+# First run: another runner lands on main, so the branch is gated again under the land lock.
+# Second run: someone commits a plan on main in the main checkout, without pushing it.
+echo run >> "$DANGLE_PRIMARY/.gate-runs"
+cd "$DANGLE_PRIMARY" || exit 1
+case $(wc -l < .gate-runs | tr -d ' ') in
+  1) echo pushed > pushed.txt && git add pushed.txt && git commit -qm pushed && git push -q origin main ;;
+  2) echo local > plans/local.md && git add plans/local.md && git commit -qm "local plan" ;;
+esac
+exit 0
+EOF2
+printf '.gate-runs\n' > .gitignore
+commit "localcommit"
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "a commit made on the base branch during the gate is kept and pushed with the landing" '[ -f a.txt ] && [ -f pushed.txt ] && [ -f plans/local.md ] && git log --format=%s main | grep -q "^local plan$" && [ "$(git rev-parse main)" = "$(git rev-parse origin/main)" ] && grep -q "1 landed" "$tmp/out"'
+
 repo outoforder
 plan 010-needs-later.md a.txt '<!-- dangle: depends=020 -->'
 plan 020-first.md b.txt
