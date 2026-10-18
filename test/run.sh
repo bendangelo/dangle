@@ -448,6 +448,20 @@ commit "json agent"
 DANGLE_TEST_AGENT="$tmp/agent" "$DANGLE" -y > "$tmp/out" 2>&1
 check "a JSON event stream becomes readable lines in the log and the heartbeat" 'grep -q "agent [0-9]*s  │ → bash cargo test -p widgets" "$tmp/out" && grep -q "^All done.$" .git/dangle/logs/010.log && [ -s .git/dangle/logs/010.jsonl ] && [ -f a.txt ]'
 
+repo editor
+plan 010-a.md a.txt
+commit
+# The agent amends its commit without --no-edit; your editor must not open.
+cat > "$tmp/amend-agent" <<'EOF2'
+#!/bin/sh
+"$DANGLE_TEST_AGENT" "$@" && git commit --amend -q && touch "$DANGLE_TEST_TMP/amended"
+EOF2
+chmod +x "$tmp/amend-agent"
+printf '#!/bin/sh\ntouch "%s/editor-opened"\nexit 1\n' "$tmp" > "$tmp/fake-editor"; chmod +x "$tmp/fake-editor"
+printf 'BASE=main\nPLANS=plans\nAGENT=%s\n' "$tmp/amend-agent" > .dangle/config
+commit "amend agent"
+GIT_EDITOR="$tmp/fake-editor" DANGLE_TEST_TMP="$tmp" DANGLE_TEST_AGENT="$tmp/agent" "$DANGLE" -y > "$tmp/out" 2>&1
+check "an agent's git commands never open an editor" '[ -f "$tmp/amended" ] && [ ! -e "$tmp/editor-opened" ] && [ -f a.txt ]'
 
 repo pickup
 plan 010-a.md a.txt

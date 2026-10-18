@@ -677,6 +677,10 @@ run_agent() {
     cd "$dir" || exit 1
     set -f; set -- $AGENT_CMD; set +f
     DANGLE=1 DANGLE_MODEL=${AGENT_LABEL#*:}; export DANGLE DANGLE_MODEL
+    # No one is there to type: a `git commit --amend` or `rebase` must not wait in an editor,
+    # nor a push or fetch at a password prompt.
+    GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true GIT_TERMINAL_PROMPT=0 GIT_PAGER=cat
+    export GIT_EDITOR GIT_SEQUENCE_EDITOR GIT_TERMINAL_PROMPT GIT_PAGER
     # The raw event stream goes to <log>.jsonl; the log itself gets one readable line per step.
     { run_limited "$AGENT_SECS" "$@" "$prompt" < /dev/null 2>&1; echo $? > "$log.rc"; } |
       tee -a "${log%.log}.jsonl" | readable >> "$log"
