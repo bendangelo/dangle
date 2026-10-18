@@ -462,6 +462,9 @@ new_worktree() {
     git worktree add -q "$path" "$branch" || return 1
   else
     git worktree add -q -b "$branch" "$path" "$from" || return 1
+    # Where the branch started: on_base tells a branch with no work yet from one whose work
+    # has since reached the base branch.
+    git config "branch.$branch.danglebase" "$(git rev-parse "$from")"
   fi
   copy_into "$path"
   if [ "$PRIVATE" = 1 ]; then
@@ -486,6 +489,21 @@ remove_worktree() {
   if git show-ref -q --verify "refs/heads/$branch"; then
     if [ -n "$force" ]; then git branch -q -D "$branch"; else git branch -q -d "$branch"; fi
   fi
+}
+
+# on_base <branch>: the branch has work of its own, and all of it is on the base branch already:
+# landed by hand (merged, fast-forwarded, squashed or cherry-picked) after a failed run. Nothing
+# is left for an agent but the plan file to retire. Branches made before dangle recorded where
+# they started fall back to the branch's reflog.
+on_base() {
+  local tip fork tree
+  tip=$(git rev-parse -q --verify "refs/heads/$1") || return 1
+  fork=$(git config "branch.$1.danglebase" 2>/dev/null ||
+    git reflog show --format=%H "refs/heads/$1" 2>/dev/null | tail -n 1)
+  [ -n "$fork" ] && [ "$tip" != "$fork" ] || return 1
+  # Merging the branch into the base branch would change nothing.
+  tree=$(git merge-tree --write-tree "refs/heads/$BASE" "$tip" 2>/dev/null | head -n 1)
+  [ -n "$tree" ] && [ "$tree" = "$(git rev-parse "refs/heads/$BASE^{tree}")" ]
 }
 
 # ---------------------------------------------------------------- plans
@@ -1160,7 +1178,7 @@ $f"
     n=$((n + 1)); id=$(plan_id "$f"); branch="$PREFIX$id"; path=$(wt_path "$branch")
     say ""
     say "  $id  $(plan_title "$f")"
-    t0=$(date +%s); result=
+    t0=$(date +%s); result= t1=
     if [ ! -f "$f" ]; then
       result="skipped  (landed by another run)"
     elif [ "$PRIVATE" = 0 ] && ! git cat-file -e "refs/heads/$BASE:$PLANS/${f##*/}" 2>/dev/null; then
@@ -1183,7 +1201,17 @@ $f"
       fi
       spec=${agent:-$(plan_field "$f" agent)}
       spec=${spec:-$(cfg AGENT)}
-      if [ -z "$FAIL_REASON" ]; then
+      if [ -z "$FAIL_REASON" ] && on_base "$branch"; then
+        # Its work landed by hand: no agent, only the plan to retire.
+        say "  worktree  its work is on $BASE already (landed by hand); retiring the plan"
+        git -C "$path" reset -q --hard "refs/heads/$BASE"
+        if [ "$PRIVATE" = 1 ]; then
+          done_on_disk "$f" && remove_worktree "$branch" force && result=landed
+        else
+          LAND_RESULT=
+          if land "$branch" "$f" '' 0; then result=${LAND_RESULT:-landed}; fi
+        fi
+      elif [ -z "$FAIL_REASON" ]; then
         export_ctx "$path" "$branch"
         DANGLE_PLAN=$id DANGLE_PLAN_FILE="$PLANS/${f##*/}"; export DANGLE_PLAN DANGLE_PLAN_FILE
         DANGLE_T_plan="$PLANS/${f##*/}" DANGLE_T_id=$id DANGLE_T_branch=$branch DANGLE_T_base=$BASE \
@@ -1239,6 +1267,7 @@ cmd_status() {
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then state="running"
     elif [ -f "$STATE/submitted/$id" ]; then state="submitted"
     elif [ -n "$deps" ]; then state="waiting"
+    elif on_base "$PREFIX$id"; then state="on-$BASE"
     elif [ -d "$(wt_path "$PREFIX$id")" ]; then state="kept"
     else state="ready"; fi
     printf '%-8s %-10s %s\n' "$id" "$state" "$(plan_title "$f")"

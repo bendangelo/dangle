@@ -103,6 +103,27 @@ check "its dependent is skipped" 'grep -q "waits for 010" "$tmp/out" && [ ! -f b
 check "an independent plan still lands" '[ -f c.txt ]'
 check "exit code 1 when a plan failed" '[ $rc = 1 ]'
 
+# A failed plan whose work then lands by hand (fixed in its kept worktree, merged into main):
+# the next run retires the plan instead of asking the agent for commits it cannot make.
+for how in merge squash; do
+  repo "byhand-$how"
+  printf 'BASE=main\nPLANS=plans\nAGENT=%s\nFIXES=0\n' "$tmp/agent" > .dangle/config
+  plan 010-a.md a.txt 'Agent: race'
+  plan 020-b.md b.txt '<!-- dangle: depends=010 -->'
+  commit
+  "$DANGLE" -y > "$tmp/out" 2>&1
+  ( cd .worktrees/plan-010 && { git merge -q main >/dev/null 2>&1; echo by-hand > README; } &&
+    git add -A && git commit -qm "merge main by hand" )
+  if [ $how = merge ]; then git merge -q --ff-only plan-010
+  else git merge -q --squash plan-010 && git commit -qm "squashed by hand"; fi
+  git push -q origin main
+  "$DANGLE" status > "$tmp/out" 2>&1
+  check "status shows work landed by hand ($how)" 'grep -q "^010 *on-main" "$tmp/out"'
+  "$DANGLE" -y > "$tmp/out" 2>&1
+  check "work landed by hand retires the plan ($how)" 'grep -q "landed by hand" "$tmp/out" && grep -q "010 landed" "$tmp/out" && [ -f plans/done/010-a.md ] && [ ! -d .worktrees/plan-010 ] && ! sed -n "/^  010 /,/010 landed/p" "$tmp/out" | grep -q "^  agent "'
+  check "and its dependent runs ($how)" '[ -f b.txt ] && [ -f plans/done/020-b.md ]'
+done
+
 repo fix
 plan 010-broken.md x.txt 'Agent: broken'
 commit

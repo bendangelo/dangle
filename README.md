@@ -96,7 +96,7 @@ dangle 865 870                 # only these, in this order, then stop
 dangle 865 --rest              # 865 first, then everything else
 dangle -a claude:haiku         # pick the agent for this run
 dangle -a opus                 # the default agent with another model
-dangle status                  # ready, waiting, running, kept, submitted
+dangle status                  # ready, waiting, running, kept, on-<base>, submitted
 dangle 866                     # continue a failed plan in its kept worktree (--fresh: start over)
 dangle --watch                 # never run out: wait for new plans when the queue is empty
 ```
@@ -180,6 +180,11 @@ dangle audit --apply               # moves the ones found done to done/, in one 
 Check the plans it calls done before `--apply`. A plan it calls partial is worth a short
 "Corrections" section at the top saying what is already there; the skill from `dangle skill`
 walks an agent through all of this.
+
+One case needs no audit: a plan that failed (a conflict, a gate) whose kept worktree you then
+fixed and merged into the base branch yourself, by merge, fast-forward, squash or cherry-pick.
+`dangle status` shows it as `on-<base>`, and the next run retires it without an agent: the plan
+moves to done/ through the usual landing, and the plans waiting for it run.
 
 ## Agents
 
