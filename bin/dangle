@@ -63,6 +63,40 @@ minutes() {
   if [ $d -lt 60 ]; then printf '%ds' $d; elif [ $d -lt 3600 ]; then printf '%dm' $((d / 60)); else printf '%dh%02dm' $((d / 3600)) $((d % 3600 / 60)); fi
 }
 
+# span <seconds>: a short duration for an estimate, at least a minute, without a zero minute part.
+span() {
+  local d="$1" h m
+  [ "$d" -lt 60 ] && d=60
+  if [ "$d" -lt 3600 ]; then printf '%dm' $((d / 60)); return; fi
+  h=$((d / 3600)); m=$((d % 3600 / 60))
+  if [ "$m" = 0 ]; then printf '%dh' "$h"; else printf '%dh%02dm' "$h" "$m"; fi
+}
+
+# estimate_run <plans>: a range for the whole run, from the last 20 plan cycles (agent,
+# checks and landing). Until there is history, 30m-1h per plan.
+estimate_run() {
+  local plans="$1" lo=1800 hi=3600 samples=0 total_lo total_hi per
+  [ "$plans" != 0 ] || { printf 'estimate  waiting for plans'; return; }
+  if [ -s "$STATE/durations" ]; then
+    samples=$(tail -n 20 "$STATE/durations" | wc -l | tr -d ' ')
+    read -r lo hi <<EOF
+$(tail -n 20 "$STATE/durations" | sort -n | awk '{a[NR]=$1} END {
+  print a[int(NR * 0.25 + 0.999)], a[int(NR * 0.75 + 0.999)]
+}')
+EOF
+  fi
+  total_lo=$((lo * plans)); total_hi=$((hi * plans))
+  if [ "$lo" = "$hi" ]; then per="$(span "$lo") each"; else per="$(span "$lo")-$(span "$hi") each"; fi
+  if [ "$samples" = 0 ]; then per="$per, no past runs"; else per="$per, from $samples past plans"; fi
+  if [ "$total_lo" = "$total_hi" ]; then
+    printf 'estimate  ~%s for %s plan(s) (%s)' "$(span "$total_lo")" "$plans" "$per"
+  else
+    printf 'estimate  ~%s-%s for %s plan(s) (%s)' "$(span "$total_lo")" "$(span "$total_hi")" "$plans" "$per"
+  fi
+}
+
+record_duration() { printf '%s\n' "$1" >> "$STATE/durations"; }
+
 # ---------------------------------------------------------------- repository and config
 
 find_repo() {
@@ -620,19 +654,21 @@ without() { printf '%s\n' "$1" | grep -Fxv -- "$2"; }
 DEFAULT_PROMPT='You are working in a git worktree of this repository, on branch {{branch}}.
 
 Implement the plan in {{plan}}. Read it in full first, then follow the repository'"'"'s own
-instructions (AGENTS.md, CLAUDE.md, and any skills or files the plan names).
+instructions and conventions (for example AGENTS.md, CLAUDE.md, CONTRIBUTING.md, README,
+and any files the plan names).
 
-- Commit your work on this branch as you go. Earlier work may already be committed here:
-  continue from it.
-- Do not merge, push, rebase, switch branches, or move or edit the plan file. dangle lands
-  this branch after you finish, and only if its gate passes.
-- Before you stop, run the gate and make it pass: {{gate}}
+- Commit your work on this branch as you go, following the repository'"'"'s commit style.
+  Earlier work may already be committed here: continue from it.
+- Do not merge, push, rebase, switch branches, or move or edit the plan file. An automated
+  runner integrates this branch after you finish, and only if the project'"'"'s checks pass.
+- Before you stop, run the project'"'"'s checks and make them pass: {{gate}}
+- If the plan is ambiguous, choose the smallest reasonable interpretation and note it.
 - If the plan cannot be done as written, commit what is safe and say why in your last message.'
 
-DEFAULT_FIX_PROMPT='The gate failed for the work on branch {{branch}}, which implements the plan in {{plan}}.
+DEFAULT_FIX_PROMPT='The project'"'"'s checks failed for the work on branch {{branch}}, which implements the plan in {{plan}}.
 
-The end of the gate'"'"'s output is below; all of it is in {{gate_log}}.
-Find the cause, fix it, commit, and stop. Run the gate again to check: {{gate}}
+The end of the checks'"'"' output is below; all of it is in {{gate_log}}.
+Find the cause, fix it, commit, and stop. Run the checks again to verify: {{gate}}
 Do not merge, push, or edit the plan file.
 
 {{gate_tail}}'
@@ -643,7 +679,7 @@ conflicts. The merge is in progress in this worktree (see git status); the confl
 
 Resolve every conflict so both sides'"'"' work survives. {{base}} has already landed, so its names
 and shapes win: adapt this branch'"'"'s side to them. Then git add the files and finish the merge with
-git commit --no-edit, and run the gate to check: {{gate}}
+git commit --no-edit, and run the project'"'"'s checks: {{gate}}
 Do not abort the merge, rebase, push, or edit the plan file.'
 
 DEFAULT_AUDIT_PROMPT='Do not change, create or delete any file, and do not commit: this is a read-only check.
@@ -1120,7 +1156,11 @@ $f"
   fi
 
   resolve_agent "${agent:-$(cfg AGENT)}" "$(cfg AGENT)"
+  local estimate said_estimate=0
+  estimate=$(estimate_run "$total")
   if [ $yes = 0 ] && [ -t 0 ] && [ -t 1 ]; then
+    say "  $estimate"
+    said_estimate=1
     printf 'Run %s plan(s)%s with %s onto %s? [Y/n] ' "$total" "$([ $watch = 1 ] && printf ' and watch for more')" "$AGENT_LABEL" "$BASE"
     read -r line || line=n
     case $line in ''|y|Y|yes) ;; *) return 0 ;; esac
@@ -1137,6 +1177,7 @@ $f"
   printf '# dangle run %s\n\nagent %s, base %s\n\n' "$(date)" "$AGENT_LABEL" "$BASE" > "$summary"
   art_stick
   say "  dangle · $total plan(s)$([ $watch = 1 ] && printf ', watching for more') · agent $AGENT_LABEL · base $BASE"
+  [ $said_estimate = 1 ] || say "  $estimate"
   find "$STATE" -maxdepth 1 -name 'landed-*' -mtime +1 -exec rm -f {} + 2>/dev/null
   synced
   tstart=$(date +%s)
@@ -1190,7 +1231,7 @@ $f"
     n=$((n + 1)); id=$(plan_id "$f"); branch="$PREFIX$id"; path=$(wt_path "$branch")
     say ""
     say "  $id  $(plan_title "$f")"
-    t0=$(date +%s); result='' t1=''
+    t0=$(date +%s); result='' t1='' timed=0
     if [ ! -f "$f" ]; then
       result="skipped  (landed by another run)"
     elif [ "$PRIVATE" = 0 ] && ! git cat-file -e "refs/heads/$BASE:$PLANS/${f##*/}" 2>/dev/null; then
@@ -1230,6 +1271,7 @@ $f"
           DANGLE_T_title=$(plan_title "$f") DANGLE_T_gate=$(gate_desc)
         export DANGLE_T_plan DANGLE_T_id DANGLE_T_branch DANGLE_T_base DANGLE_T_title DANGLE_T_gate
         t1=$(date +%s)
+        timed=1
         run_agent "$spec" "$path" "$STATE/logs/$id.log" "$(render "$(template prompt.md "$DEFAULT_PROMPT")")"
         t1=$(( $(date +%s) - t1 ))
         commit_leftovers "$path"
@@ -1252,6 +1294,7 @@ $f"
       unclaim "$id"
     fi
     note_result "$result"
+    [ "$timed" = 1 ] && record_duration "$(( $(date +%s) - t0 ))"
     if [ $fast -ge 2 ]; then
       say ""
       say "  stopping: the agent failed fast twice in a row (out of credit or usage? signed out? model down?)"

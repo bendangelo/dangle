@@ -108,6 +108,13 @@ it; a private plan, until it has not changed for a minute. With `--watch`, an em
 one blocked by a failed plan, waits for more (every `DANGLE_POLL` seconds, default 30) instead
 of ending the run; Ctrl-C ends it and writes the summary.
 
+Before it starts, dangle estimates how long the run will take from how long recent plan cycles
+took (agent, checks and landing); until it has history it assumes 30m–1h per plan:
+
+```
+  estimate  ~1h-2h for 2 plan(s) (30m-1h each, from 4 past plans)
+```
+
 While an agent or the gate runs, a line every 5 minutes says how long it has run and what it
 printed last (`HEARTBEAT=5m`, `0` turns it off):
 

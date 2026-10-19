@@ -19,6 +19,7 @@ check() { if eval "$2"; then ok "$1"; else no "$1" "$(cat "$tmp/out" 2>/dev/null
 cat > "$tmp/agent" <<'EOF'
 #!/bin/sh
 prompt=$(eval "printf '%s' \"\${$#}\"")
+[ -z "${DANGLE_TEST_PROMPT:-}" ] || printf '%s\n' "$prompt" > "$DANGLE_TEST_PROMPT"
 case $prompt in *"Reply with the single word OK"*) echo OK; exit 0 ;; esac
 case $prompt in *"read-only check"*)
   p=$(printf '%s\n' "$prompt" | sed -n 's/.*plan in \([^ ]*\.md\).*/\1/p' | head -n 1)
@@ -27,7 +28,7 @@ case $prompt in *"read-only check"*)
   exit 0 ;;
 esac
 plan=$(printf '%s\n' "$prompt" | sed -n 's/.*plan in \([^ ,]*\.md\).*/\1/p' | head -n 1)
-case $prompt in *"The gate failed"*) rm -f BAD; git add -A; git commit -qm "fix: remove BAD"; exit 0 ;; esac
+case $prompt in *"checks failed"*) rm -f BAD; git add -A; git commit -qm "fix: remove BAD"; exit 0 ;; esac
 # The merge prompt: "Agent: race" resolves the conflict, "Agent: race-bad" commits the markers.
 case $prompt in *"stopped on"*)
   grep -q '^Agent: race-bad' "$plan" || echo resolved > README
@@ -91,6 +92,34 @@ check "one squashed commit per plan" '[ "$(git rev-list --count main)" = 4 ]'
 check "commit subject is the plan title" 'git log -1 --format=%s | grep -q "^Plan 020-two.md$"'
 check "worktrees are removed" '[ -z "$(ls .worktrees 2>/dev/null)" ] && [ -z "$(git branch --list "plan-*")" ]'
 check "the carrot summary" 'grep -q "2 landed" "$tmp/out"'
+
+repo estimate
+plan 010-a.md a.txt
+plan 020-b.md b.txt
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "a run says how long it may take before starting" 'grep -q "estimate  ~1h-2h for 2 plan(s) (30m-1h each, no past runs)" "$tmp/out"'
+check "the run records each plan's time" '[ "$(wc -l < .git/dangle/durations | tr -d " ")" = 2 ]'
+plan 030-c.md c.txt
+plan 040-d.md d.txt
+commit "plans 030 and 040"
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "a later run estimates from past plan times" 'grep -q "estimate  .* for 2 plan(s) (.*from 2 past plans)" "$tmp/out"'
+
+repo estimate-spread
+mkdir -p .git/dangle
+printf '600\n2400\n' > .git/dangle/durations
+plan 010-a.md a.txt
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "the estimate covers the spread of past cycle times" 'grep -q "estimate  ~10m-40m for 1 plan(s) (10m-40m each, from 2 past plans)" "$tmp/out"'
+
+repo genericprompt
+plan 010-a.md a.txt
+commit
+DANGLE_TEST_PROMPT="$tmp/prompt" "$DANGLE" -y > "$tmp/out" 2>&1
+check "the prompt describes the runner instead of saying dangle lands" '! grep -q "dangle lands" "$tmp/prompt" && grep -q "automated" "$tmp/prompt"'
+check "the prompt sends the agent to generic repository instructions" 'grep -q "CONTRIBUTING.md" "$tmp/prompt" && grep -q "project.s checks" "$tmp/prompt"'
 
 repo deps
 plan 010-bad.md a.txt 'Agent: idle'
