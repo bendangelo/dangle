@@ -289,6 +289,10 @@ ALIAS_cheap=claude:haiku
 
 `DANGLE_AGENT`, `DANGLE_FIX_AGENT` and `DANGLE_REMOTE` in the environment override them.
 
+`dangle doctor` checks that `REMOTE/$BASE` is reachable for a fetch. When a fetch fails anyway —
+an empty or dead SSH agent, an offline laptop — dangle says why, once, and goes on with the
+local `BASE` rather than repeating the warning on every poll.
+
 ## Development
 
 ```sh

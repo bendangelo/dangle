@@ -506,6 +506,18 @@ commit "plan 020"
 i=0; while [ $i -lt 60 ] && ! grep -q "020 landed" "$tmp/out"; do sleep 0.5; i=$((i + 1)); done
 kill -TERM $run; wait $run; rc=$?
 check "--watch waits for a new plan, runs it, and ends on a signal with a summary" '[ $rc = 0 ] && grep -q "picked up  020" "$tmp/out" && grep -q "stopped watching" "$tmp/out" && [ -f b.txt ] && grep -q "2 landed" .git/dangle/last-run.md'
+
+# A remote that cannot be reached: the fetch warning names git's real reason, once per distinct
+# failure, and the run goes on with the local base branch.
+repo unreachable
+plan 010-a.md a.txt
+commit
+git remote set-url origin "$tmp/no-such-remote.git"
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "an unreachable remote says why it could not fetch" 'grep -q "could not fetch origin/main" "$tmp/out" && grep -q "does not appear to be a git repository" "$tmp/out"'
+check "the same fetch error is not repeated" '[ "$(grep -c "could not fetch" "$tmp/out")" = 1 ]'
+"$DANGLE" doctor > "$tmp/out" 2>&1
+check "doctor warns when the remote cannot be reached" 'grep -q "cannot reach origin" "$tmp/out" && grep -q "does not appear to be a git repository" "$tmp/out"'
 echo
 echo "$pass passed, $failed failed"
 [ $failed = 0 ]

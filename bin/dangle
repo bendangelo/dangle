@@ -390,9 +390,17 @@ advance_base() {
 # not pushed yet (plans, notes) are rebased onto the remote's.
 sync_base() {
   [ -n "$REMOTE" ] || return 0
-  local here there bw
-  if ! git fetch -q "$REMOTE" "$BASE" 2>/dev/null; then
-    err "could not fetch $REMOTE/$BASE; going on with the local $BASE"
+  local here there bw why
+  if ! why=$(git fetch -q "$REMOTE" "$BASE" 2>&1 >/dev/null); then
+    # Say git's own reason, once: a run that waits on another runner polls sync_base every
+    # 30s, and the same failure should not fill the terminal. A later, different failure is
+    # reported again.
+    [ -n "$why" ] || why='git fetch failed'
+    if [ "${FETCH_WHY:-}" != "$why" ]; then
+      FETCH_WHY=$why
+      err "could not fetch $REMOTE/$BASE; going on with the local $BASE"
+      printf '%s\n' "$why" | sed 's/^/  /' >&2
+    fi
     return 0
   fi
   here=$(git rev-parse "refs/heads/$BASE"); there=$(git rev-parse "refs/remotes/$REMOTE/$BASE")
@@ -1330,7 +1338,15 @@ cmd_doctor() {
     resolve_agent "$(cfg FIX_AGENT)" "$(cfg AGENT)"
     command -v "${AGENT_CMD%% *}" >/dev/null 2>&1 && ok "fix agent $AGENT_LABEL" || no "fix agent command '${AGENT_CMD%% *}' not found"
   fi
-  [ -n "$REMOTE" ] && ok "remote $REMOTE (fetched before and pushed after each landing)" || warn "no remote: landings stay local"
+  if [ -z "$REMOTE" ]; then
+    warn "no remote: landings stay local"
+  elif out=$(git ls-remote -q "$REMOTE" "refs/heads/$BASE" 2>&1); then
+    ok "remote $REMOTE (fetched before and pushed after each landing)"
+  else
+    warn "cannot reach $REMOTE: landings will fail until it is reachable"
+    printf '%s\n' "$out" | sed 's/^/        /'
+    case $out in *publickey*|*"Permission denied"*) warn "if this is SSH, check your agent: ssh-add -l" ;; esac
+  fi
   [ -n "$TIMEOUT_BIN" ] && ok "time limits ($TIMEOUT_BIN)" || warn "no timeout command (coreutils); a hung agent's own children may outlive its time limit"
   command -v systemd-inhibit >/dev/null 2>&1 || command -v caffeinate >/dev/null 2>&1 || warn "nothing to keep the computer awake (systemd-inhibit or caffeinate)"
   if [ $probe = 1 ] && [ -n "$(cfg AGENT)" ]; then
