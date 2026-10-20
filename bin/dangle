@@ -378,6 +378,7 @@ cleanup() {
   local d
   for d in "$STATE"/claims/*; do [ -d "$d" ] && drop_lock "$d"; done
   drop_lock "$STATE/land.lock"
+  rm -f "$STATE/started.$$"
 }
 
 # ---------------------------------------------------------------- the base branch
@@ -564,13 +565,15 @@ plan_files() {
 plan_id() {
   basename "$1" .md | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}-//; s/^([0-9]+)(-.*)?$/\1/'
 }
-plan_title() { sed -n 's/^#[[:space:]]*//p' "$1" | head -n 1; }
+# A plan file can vanish mid-run (another dangle landed it): the readers then say nothing.
+plan_title() { [ -f "$1" ] || return 0; sed -n 's/^#[[:space:]]*//p' "$1" | head -n 1; }
 # plan_field <file> <key>: from the header comment `<!-- dangle: depends=1,2 agent=claude:sonnet -->`
 plan_field() {
+  [ -f "$1" ] || return 0
   sed -n 's/.*<!--[[:space:]]*dangle:\(.*\)-->.*/\1/p' "$1" | head -n 1 | tr ' ' '\n' |
     sed -n "s/^$2=//p" | head -n 1
 }
-plan_done_when() { sed -n 's/^[*_]*Done when:[*_]*[^`]*`\([^`]*\)`.*/\1/p' "$1" | head -n 1; }
+plan_done_when() { [ -f "$1" ] || return 0; sed -n 's/^[*_]*Done when:[*_]*[^`]*`\([^`]*\)`.*/\1/p' "$1" | head -n 1; }
 
 # Ids of plans landed on the base branch: the files in <plans>/<done>/ there.
 # Cached per commit of the base branch: a run asks this for every plan, again and again.
@@ -648,6 +651,11 @@ running_elsewhere() {
 }
 
 without() { printf '%s\n' "$1" | grep -Fxv -- "$2"; }
+# mine <files>: those no other live dangle is running.
+mine() {
+  local g
+  for g in $1; do running_elsewhere "$(plan_id "$g")" || printf '%s\n' "$g"; done
+}
 
 # ---------------------------------------------------------------- prompts
 
@@ -1069,6 +1077,29 @@ $g"
   done
 }
 
+# prune: drops from the queue (cmd_run's pending and total) the plans another dangle finished
+# meanwhile: landed (the file left the plans folder) or failed since this run started. They
+# are not this run's steps, so they leave the count instead of showing as skipped.
+prune() {
+  local g gid why keep=''
+  for g in $pending; do
+    gid=$(plan_id "$g")
+    if [ ! -f "$g" ]; then
+      if is_landed "$gid"; then why="landed by another run"; else why="no longer in $PLANS"; fi
+    elif ! running_elsewhere "$gid" && [ -n "$(find "$STATE/results/$gid" -newer "$STATE/started.$$" 2>/dev/null)" ] &&
+      grep -q ' FAILED' "$STATE/results/$gid"; then
+      why="failed in another run (dangle status)"
+    else
+      keep="$keep
+$g"; continue
+    fi
+    total=$((total - 1)); elsewhere=$((elsewhere + 1))
+    say "  $gid  $why"
+    printf -- '- %s %s\n' "$gid" "$why" >> "$summary"
+  done
+  pending=$(printf '%s\n' "$keep" | sed '/^$/d')
+}
+
 # idle: one poll of --watch; 1 when Ctrl-C (or TERM) asks the run to end.
 idle() {
   trap 'STOP=1' INT TERM
@@ -1083,7 +1114,7 @@ idle() {
 
 cmd_run() {
   local ids='' rest=0 dry=0 yes=0 agent='' fixagent='' f id queue='' total=0 n=0 landed=0 failed=0 skipped=0 \
-    t0 t1 tstart spec path branch result fast=0 deps summary line watch=0 rescan=0 known STOP=0
+    t0 t1 tstart spec path branch result fast=0 deps summary line watch=0 rescan=0 known STOP=0 elsewhere=0
   FRESH=0 FOLLOW=0
   while [ $# -gt 0 ]; do
     case $1 in
@@ -1174,6 +1205,7 @@ $f"
   trap 'cleanup; exit 130' INT TERM
   trap cleanup EXIT
   summary="$STATE/last-run.md"
+  : > "$STATE/started.$$"
   printf '# dangle run %s\n\nagent %s, base %s\n\n' "$(date)" "$AGENT_LABEL" "$BASE" > "$summary"
   art_stick
   say "  dangle · $total plan(s)$([ $watch = 1 ] && printf ', watching for more') · agent $AGENT_LABEL · base $BASE"
@@ -1190,6 +1222,7 @@ $f"
   local pending=$queue waiting said=''
   while :; do
     [ $rescan = 0 ] || pick_up
+    prune
     if [ -z "$pending" ]; then
       [ $watch = 1 ] || break
       [ "$said" = idle ] || { say ""; say "  watching $PLANS for new plans (Ctrl-C ends the run)"; }
@@ -1197,11 +1230,15 @@ $f"
       idle || break
       continue
     fi
-    if ! f=$(first_ready "$pending"); then
+    # A plan another dangle runs stays queued: it lands there (prune drops it), or comes back
+    # here when that dangle dies.
+    if ! f=$(first_ready "$(mine "$pending")"); then
       waiting=''
       for f in $pending; do
+        if running_elsewhere "$(plan_id "$f")"; then waiting="$waiting $(plan_id "$f")"; continue; fi
         for d in $(unmet "$f"); do running_elsewhere "$d" && waiting="$waiting $d"; done
       done
+      [ -z "$waiting" ] || { waiting=$(printf '%s\n' $waiting | sort -u | tr '\n' ' '); waiting=" ${waiting% }"; }
       if [ -n "$waiting" ]; then
         [ "$said" = "$waiting" ] || say "  waiting for$waiting: another dangle is running it"
         said=$waiting
@@ -1227,22 +1264,21 @@ $f"
       done
       break
     fi
+    id=$(plan_id "$f")
+    # Lost a race for the claim: the next look sees the plan as running elsewhere.
+    [ -f "$STATE/submitted/$id" ] && [ -z "$ids" ] || claim "$id" || continue
     pending=$(without "$pending" "$f"); said=''
-    n=$((n + 1)); id=$(plan_id "$f"); branch="$PREFIX$id"; path=$(wt_path "$branch")
+    n=$((n + 1)); branch="$PREFIX$id"; path=$(wt_path "$branch")
     say ""
     say "  $id  $(plan_title "$f")"
     t0=$(date +%s); result='' t1='' timed=0
-    if [ ! -f "$f" ]; then
-      result="skipped  (landed by another run)"
-    elif [ "$PRIVATE" = 0 ] && ! git cat-file -e "refs/heads/$BASE:$PLANS/${f##*/}" 2>/dev/null; then
+    if [ "$PRIVATE" = 0 ] && ! git cat-file -e "refs/heads/$BASE:$PLANS/${f##*/}" 2>/dev/null; then
       result="skipped  (not committed on $BASE)"
     elif [ -f "$STATE/submitted/$id" ] && [ -z "$ids" ]; then
       result="skipped  (submitted $(cat "$STATE/submitted/$id"); waiting for it to land)"
-    elif ! claim "$id"; then
-      result="skipped  (another dangle is running it)"
     fi
     if [ -n "$result" ]; then
-      skipped=$((skipped + 1))
+      skipped=$((skipped + 1)); unclaim "$id"
     else
       FAIL_REASON=
       if [ -d "$path" ] && [ $FRESH = 0 ]; then
@@ -1303,10 +1339,10 @@ $f"
     fi
   done
 
-  printf '\n%s landed, %s failed, %s skipped, %s\n' "$landed" "$failed" "$skipped" "$(minutes "$tstart" "$(date +%s)")" >> "$summary"
+  printf '\n%s landed, %s failed, %s skipped, %s finished by another run, %s\n' "$landed" "$failed" "$skipped" "$elsewhere" "$(minutes "$tstart" "$(date +%s)")" >> "$summary"
   if [ $landed -gt 0 ]; then art_carrot; else fancy && art_stick && say "  no carrot tonight"; fi
   say ""
-  say "  $landed landed · $failed failed · $skipped skipped · $(minutes "$tstart" "$(date +%s)")"
+  say "  $landed landed · $failed failed · $skipped skipped$([ $elsewhere = 0 ] || printf ' · %s by another run' "$elsewhere") · $(minutes "$tstart" "$(date +%s)")"
   say "  summary: $summary"
   [ -x "$HOOKS/done" ] && hook "done" "$PRIMARY" "$summary"
   [ $failed = 0 ]

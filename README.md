@@ -153,7 +153,9 @@ plans before it; and nothing ever needs to merge two agents' work at once.
 When the machine has room for more, open another terminal in the same repository and start
 another `dangle`. Runners in one repository share the work safely:
 
-- each plan is **claimed** by the runner that starts it, and the others skip it;
+- each plan is **claimed** by the runner that starts it, and the others pass over it: when it
+  lands they drop it from their count, when it fails there they leave it, and when that runner
+  dies they take it over;
 - a plan that depends on one another runner is working on **waits** for it to land, then runs;
 - **landings take turns** (one lock), and each landing merges in what the others landed first.
 

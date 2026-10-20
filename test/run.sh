@@ -309,12 +309,41 @@ repo claims
 plan 010-a.md a.txt
 plan 020-b.md b.txt
 commit
-mkdir -p .git/dangle/claims/010 && echo $$ > .git/dangle/claims/010/pid
-"$DANGLE" -y > "$tmp/out" 2>&1
-check "a plan another dangle is running is skipped" 'grep -q "another dangle is running it" "$tmp/out" && [ ! -f a.txt ] && [ -f b.txt ]'
-echo 999999 > .git/dangle/claims/010/pid
-"$DANGLE" -y > "$tmp/out" 2>&1
-check "a dead run's claim is taken over" '[ -f a.txt ]'
+sleep 300 & other=$!
+mkdir -p .git/dangle/claims/010 && echo $other > .git/dangle/claims/010/pid
+DANGLE_POLL=1 "$DANGLE" -y > "$tmp/out" 2>&1 & run=$!
+until grep -q "waiting for 010" "$tmp/out" 2>/dev/null; do sleep 1; done
+# The other terminal lands 010.
+mkdir -p plans/done && git mv plans/010-a.md plans/done/
+echo a > a.txt && git add -A && git commit -qm "Plan 010" && git push -q origin main
+wait $run; rc=$?; kill $other
+check "a plan another dangle is running is passed over, not taken" '[ $rc = 0 ] && [ -f b.txt ] && [ "$(git log --format=%s main | grep -c "^Plan 010")" = 1 ]'
+check "a plan another dangle landed leaves the count quietly" 'grep -q "010  landed by another run" "$tmp/out" && grep -q "020 landed" "$tmp/out" && grep -q "1 by another run" "$tmp/out" && ! grep -q "sed:" "$tmp/out"'
+
+repo claimdies
+plan 010-a.md a.txt
+plan 020-b.md b.txt
+commit
+sleep 300 & other=$!
+mkdir -p .git/dangle/claims/010 && echo $other > .git/dangle/claims/010/pid
+DANGLE_POLL=1 "$DANGLE" -y > "$tmp/out" 2>&1 & run=$!
+until grep -q "waiting for 010" "$tmp/out" 2>/dev/null; do sleep 1; done
+kill $other  # the other dangle dies without finishing 010
+wait $run; rc=$?
+check "a plan whose dangle died is taken over in the same run" '[ $rc = 0 ] && [ -f a.txt ] && [ -f b.txt ] && grep -q "2 landed" "$tmp/out"'
+
+repo claimfails
+plan 010-a.md a.txt
+plan 020-b.md b.txt
+commit
+sleep 300 & other=$!
+mkdir -p .git/dangle/claims/010 .git/dangle/results && echo $other > .git/dangle/claims/010/pid
+DANGLE_POLL=1 "$DANGLE" -y > "$tmp/out" 2>&1 & run=$!
+until grep -q "waiting for 010" "$tmp/out" 2>/dev/null; do sleep 1; done
+echo "$(date '+%F %T') FAILED   the gate failed" > .git/dangle/results/010
+kill $other
+wait $run; rc=$?
+check "a plan that failed in another run is not run again" '[ $rc = 0 ] && [ ! -f a.txt ] && [ -f b.txt ] && grep -q "010  failed in another run" "$tmp/out"'
 
 repo regate
 plan 010-a.md a.txt
