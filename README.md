@@ -251,6 +251,28 @@ node_modules into new worktrees" or "land through a GitHub PR and wait for CI".
 Hooks run with `DANGLE_PRIMARY` (the main checkout), `DANGLE_WORKTREE`, `DANGLE_BRANCH`,
 `DANGLE_BASE`, and for `land`, `DANGLE_TITLE`, `DANGLE_MESSAGE_FILE` and `DANGLE_REMOTE`.
 
+### The merge queue: one gate for every branch waiting
+
+With several runners (or several people landing worktrees by hand), each landing runs its own
+gate, side by side on one machine: N builds share the cores, so each takes N times as long, and
+a landing whose base moved meanwhile may gate a second time. `QUEUE=batch` puts one gate on the
+machine instead:
+
+- a landing that is ready (the base merged in, the plan moved to `done/`) **submits** its
+  branch to the queue and waits;
+- whichever waiting landing finds the queue free **drives** it: it merges every branch waiting
+  into the queue worktree (`.worktrees/dangle-queue`, kept between batches so its build output
+  stays warm), runs the gate once, and lands each branch as its own squashed commit;
+- a batch that fails is **split in half** and each half gated again, down to the branch that
+  broke it, which gets the gate log back (and its fix-ups, as without the queue); the others land;
+- a branch that conflicts with one ahead of it in the batch is handed back to merge the base
+  again, as on any landing;
+- `dangle land --no-gate` lands through the queue without the gate, in a batch of its own (a
+  release's version bump); `dangle land --now` gates and lands alone, outside the queue.
+
+`dangle queue` lists the branches waiting and who drives the queue. A `hooks/land` turns the
+queue off: the hook lands each branch its own way.
+
 ### Landing your way
 
 The built-in landing squashes the branch into one commit on the base branch and pushes it. A
@@ -273,6 +295,7 @@ dangle's worktrees work for people too:
 dangle new my-fix              # .worktrees/my-fix, with copy + setup
 cd "$(dangle path my-fix)"
 dangle land                    # gate, squash, land, remove (--keep keeps it, --fix asks the agent)
+dangle queue                   # with QUEUE=batch: the branches waiting to be gated together
 dangle list                    # worktrees, ahead/behind, changes
 dangle rm my-fix               # teardown, then remove
 ```
@@ -293,10 +316,13 @@ WORKTREES=.worktrees
 BRANCH_PREFIX=plan-
 MAX_LINES=300
 HEARTBEAT=5m         # a progress line while an agent or the gate runs; 0 = off
+QUEUE=batch          # landings share one gate (the merge queue); default: off
+QUEUE_BRANCH=dangle-queue
 ALIAS_cheap=claude:haiku
 ```
 
-`DANGLE_AGENT`, `DANGLE_FIX_AGENT` and `DANGLE_REMOTE` in the environment override them.
+`DANGLE_AGENT`, `DANGLE_FIX_AGENT`, `DANGLE_REMOTE` and `DANGLE_QUEUE` in the environment
+override them.
 
 `dangle doctor` checks that `REMOTE/$BASE` is reachable for a fetch. When a fetch fails anyway —
 an empty or dead SSH agent, an offline laptop — dangle says why, once, and goes on with the

@@ -180,6 +180,9 @@ settings() {
   AGENT_SECS=$(to_secs "$(cfg AGENT_TIMEOUT 4h)")
   GATE_SECS=$(to_secs "$(cfg GATE_TIMEOUT 60m)")
   HB_SECS=$(to_secs "$(cfg HEARTBEAT 5m)")
+  # QUEUE=batch: a landing joins the merge queue instead of running its own gate (queue_land).
+  QUEUE=${DANGLE_QUEUE:-$(cfg QUEUE off)}
+  QUEUE_BRANCH=$(cfg QUEUE_BRANCH dangle-queue)
   # Private plans: a plans folder git ignores (kept out of a public repository). They are read
   # from the main checkout, copied into each worktree, and moved to the done folder on disk.
   PRIVATE=0
@@ -378,6 +381,8 @@ cleanup() {
   local d
   for d in "$STATE"/claims/*; do [ -d "$d" ] && drop_lock "$d"; done
   drop_lock "$STATE/land.lock"
+  drop_lock "$STATE/queue.lock"
+  [ -z "$QUEUE_ENTRY" ] || rm -rf "$QUEUE_ENTRY"
   rm -f "$STATE/started.$$"
 }
 
@@ -880,7 +885,302 @@ merge_spending_fixes() {
   [ "$MERGED_BY" != agent ] || fixes=$((fixes + 1))
 }
 
+# ---------------------------------------------------------------- the merge queue
+
+# QUEUE=batch. A landing that is ready to gate (the base branch merged in, the plan moved to the
+# done folder) submits its branch to the queue and waits. Whichever waiting landing holds
+# queue.lock drives the queue: it merges every branch waiting into one worktree that stays (the
+# queue worktree, branch QUEUE_BRANCH, so its build output stays warm), runs the gate once on
+# all of them, and lands each as its own squashed commit. A batch that fails is split in half
+# and each half gated again, down to the branch that broke it; that branch gets its gate log
+# back for a fix-up. A branch that conflicts with another in the batch is handed back to merge
+# the base branch again. One gate at a time on the whole machine, instead of one per runner,
+# and no second gate when another runner lands first.
+#
+# An entry is a directory in $STATE/queue: branch, title, plan, log, nogate, pid; the driver
+# writes result (landed <sha>, failed, conflict, empty, again). Entries of dead processes are
+# dropped. A `--no-gate` entry lands in a batch of its own, ungated.
+
+QUEUE_ENTRY=
+QW=
+QBASE=
+QBUILT=
+
+# queue_submit <branch> <plan file or empty> <title or empty> <gate log> <nogate>: prints the entry.
+queue_submit() {
+  local e="$STATE/queue/$(date +%s).$$.$(printf '%s' "$1" | tr '/' '_')"
+  mkdir -p "$e"
+  printf '%s\n' "$1" > "$e/branch"
+  printf '%s\n' "$2" > "$e/plan"
+  printf '%s\n' "$3" > "$e/title"
+  printf '%s\n' "$4" > "$e/log"
+  [ -z "$5" ] || : > "$e/nogate"
+  echo $$ > "$e/pid"
+  printf '%s' "$e"
+}
+
+queue_result() { printf '%s\n' "$2" > "$1/result.tmp" && mv "$1/result.tmp" "$1/result"; }
+
+# queue_wait <entry>: until the entry has a result. When nobody drives the queue, this landing
+# does.
+queue_wait() {
+  local e="$1" pid said=''
+  while [ ! -f "$e/result" ]; do
+    if mkdir "$STATE/queue.lock" 2>/dev/null; then
+      echo $$ > "$STATE/queue.lock/pid"
+      queue_cycle
+      drop_lock "$STATE/queue.lock"
+      continue
+    fi
+    pid=$(cat "$STATE/queue.lock/pid" 2>/dev/null || true)
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -rf "$STATE/queue.lock"; continue; fi
+    [ -n "$said" ] || { say "  queue  waiting for the batch being gated${pid:+ (pid $pid)}"; said=1; }
+    sleep "${DANGLE_QUEUE_POLL:-3}"
+  done
+}
+
+# queue_entries: the waiting entries, oldest first; those of dead processes are removed.
+queue_entries() {
+  local e pid
+  for e in "$STATE"/queue/*; do
+    [ -d "$e" ] && [ -f "$e/pid" ] && [ ! -f "$e/result" ] || continue
+    pid=$(cat "$e/pid")
+    kill -0 "$pid" 2>/dev/null || { rm -rf "$e"; continue; }
+    printf '%s\n' "$e"
+  done
+}
+
+# queue_cycle: one turn of the queue, every entry waiting now. Ungated entries first.
+queue_cycle() {
+  local all e nogate='' gated=''
+  all=$(queue_entries)
+  [ -n "$all" ] || return 0
+  for e in $all; do
+    if [ -f "$e/nogate" ]; then nogate="$nogate $e"; else gated="$gated $e"; fi
+  done
+  QW=$(wt_path "$QUEUE_BRANCH")
+  if [ ! -d "$QW" ]; then
+    say "  queue  creating the queue worktree $QW"
+    if ! new_worktree "$QUEUE_BRANCH" "$BASE"; then
+      for e in $all; do
+        echo "dangle: could not create the queue worktree $QW" > "$(cat "$e/log")"
+        queue_result "$e" failed
+      done
+      return 0
+    fi
+  fi
+  synced
+  if [ -n "$nogate" ]; then
+    # shellcheck disable=SC2086
+    queue_build $nogate || for e in $nogate; do queue_result "$e" again; done
+    [ -n "$QBUILT" ] && {
+      say "  queue  landing without the gate:$(queue_names $QBUILT)"
+      queue_push nogate $QBUILT
+    }
+  fi
+  # shellcheck disable=SC2086
+  [ -z "$gated" ] || queue_gate $gated
+}
+
+queue_names() { local e; for e; do printf ' %s' "$(cat "$e/branch")"; done; }
+
+# queue_build <entries>: the queue worktree at the base branch with each entry's branch merged in,
+# in order; each entry's tree is the result up to it. A branch that does not merge (other than
+# lines both sides added, settled as on landing) is handed back. Sets QBASE and QBUILT.
+queue_build() {
+  local e b
+  QBUILT=
+  git -C "$QW" merge --abort 2>/dev/null
+  git -C "$QW" reset -q --hard "refs/heads/$BASE" && git -C "$QW" clean -fdq || return 1
+  QBASE=$(git rev-parse "refs/heads/$BASE")
+  for e; do
+    b=$(cat "$e/branch")
+    if git -C "$QW" merge -q --no-edit "refs/heads/$b" >/dev/null 2>&1 || settle_added "$QW"; then
+      git -C "$QW" rev-parse 'HEAD^{tree}' > "$e/tree"
+      QBUILT="$QBUILT $e"
+    else
+      git -C "$QW" merge --abort 2>/dev/null
+      git -C "$QW" reset -q --hard HEAD
+      say "  queue  $b conflicts with a branch ahead of it; handed back"
+      queue_result "$e" conflict
+    fi
+  done
+}
+
+# queue_checks <log> <entries>: the gate, then each plan's `Done when:` command, in the queue
+# worktree.
+queue_checks() {
+  local log="$1" e p dw
+  shift
+  run_gate "$QW" "$log" '' || return 1
+  for e; do
+    p=$(cat "$e/plan")
+    [ -n "$p" ] || continue
+    dw=$(plan_done_when "$p")
+    [ -n "$dw" ] || continue
+    printf '=== done when (%s): %s ===\n' "$(cat "$e/branch")" "$dw" >> "$log"
+    ( cd "$QW" && sh -c "$dw" ) >> "$log" 2>&1 || return 1
+  done
+}
+
+# queue_gate <entries>: builds, gates and lands them; a failed batch is split in half.
+queue_gate() {
+  local log="$STATE/logs/queue.gate.log" e i=0 half first='' second=''
+  if ! queue_build "$@"; then
+    for e; do queue_result "$e" again; done
+    return 0
+  fi
+  # shellcheck disable=SC2086
+  set -- $QBUILT
+  [ $# -gt 0 ] || return 0
+  say "  queue  gating $# branch(es):$(queue_names "$@") (log $log)"
+  export_ctx "$QW" "$QUEUE_BRANCH"
+  if queue_checks "$log" "$@"; then
+    queue_push gated "$@"
+    return 0
+  fi
+  if [ $# = 1 ]; then
+    cp "$log" "$(cat "$1/log")"
+    say "  queue  the gate failed for$(queue_names "$1")"
+    queue_result "$1" failed
+    return 0
+  fi
+  half=$((($# + 1) / 2))
+  for e; do
+    i=$((i + 1))
+    if [ $i -le $half ]; then first="$first $e"; else second="$second $e"; fi
+  done
+  say "  queue  the batch failed; gating each half"
+  # shellcheck disable=SC2086
+  queue_gate $first
+  # shellcheck disable=SC2086
+  queue_gate $second
+}
+
+# queue_message <entry> <base sha>: the squashed commit's message, as land() writes it.
+queue_message() {
+  local e="$1" b msg
+  b=$(cat "$e/branch"); msg=$(cat "$e/title")
+  if [ -z "$msg" ] && [ "$(git rev-list --no-merges --count "$2..refs/heads/$b")" = 1 ]; then
+    msg=$(git log --no-merges -1 --format=%s "$2..refs/heads/$b")
+  fi
+  [ -n "$msg" ] || msg=$b
+  printf '%s\n\nLanded by dangle from %s.\n\n' "$msg" "$b"
+  git log --no-merges --format='- %s' "$2..refs/heads/$b" | grep -v '^- dangle: '
+}
+
+# queue_push <gated|nogate> <entries>: under the land lock, one squashed commit per entry on the
+# base branch, pushed together. When the base branch moved since the build, the batch is built
+# again on it; a gated batch is gated again unless the regate hook says the move cannot matter.
+queue_push() {
+  local how="$1" tries=0 new old parent e t sha
+  shift
+  take_lock "$STATE/land.lock" "another landing"
+  while :; do
+    tries=$((tries + 1))
+    if [ $tries -gt 3 ]; then
+      drop_lock "$STATE/land.lock"
+      for e; do queue_result "$e" again; done
+      return 0
+    fi
+    sync_base
+    new=$(git rev-parse "refs/heads/$BASE")
+    if [ "$new" != "$QBASE" ]; then
+      old=$QBASE
+      queue_build "$@" || { drop_lock "$STATE/land.lock"; for e; do queue_result "$e" again; done; return 0; }
+      if [ "$how" = gated ] && { [ "$QBUILT" != "$(printf ' %s' "$@")" ] || regate_needed "$old" "$new"; }; then
+        drop_lock "$STATE/land.lock"
+        say "  queue  $BASE moved; gating again"
+        # shellcheck disable=SC2086
+        queue_gate $QBUILT
+        return 0
+      fi
+      # shellcheck disable=SC2086
+      set -- $QBUILT
+      [ $# -gt 0 ] || { drop_lock "$STATE/land.lock"; return 0; }
+    fi
+    parent=$new
+    for e; do
+      rm -f "$e/sha"
+      t=$(cat "$e/tree")
+      [ "$t" != "$(git rev-parse "$parent^{tree}")" ] || continue
+      sha=$(queue_message "$e" "$new" | git commit-tree "$t" -p "$parent") ||
+        { drop_lock "$STATE/land.lock"; for e; do queue_result "$e" again; done; return 0; }
+      echo "$sha" > "$e/sha"
+      parent=$sha
+    done
+    [ "$parent" != "$new" ] || break
+    # Someone committed on the base branch meanwhile: take that in first.
+    [ "$(git rev-parse "refs/heads/$BASE")" = "$new" ] || continue
+    if [ -n "$REMOTE" ] && ! git push -q "$REMOTE" "$parent:refs/heads/$BASE" 2>/dev/null; then
+      say "  queue  $REMOTE/$BASE moved during the landing; syncing again"
+      continue
+    fi
+    advance_base "$parent" "$new"
+    break
+  done
+  drop_lock "$STATE/land.lock"
+  for e; do
+    if [ -f "$e/sha" ]; then queue_result "$e" "landed $(cat "$e/sha")"; else queue_result "$e" empty; fi
+  done
+}
+
+# queue_land: land()'s ending under QUEUE=batch; reads and sets land()'s locals. Submits the
+# branch, waits for the queue, and on a failed gate or a conflict does what land() does: a
+# fix-up or a merge of the base branch, then submits again.
+queue_land() {
+  local e result again=0
+  while :; do
+    e=$(queue_submit "$branch" "$wplan" "${plan:+$(plan_title "$wplan")}" "$log" "$NOGATE")
+    QUEUE_ENTRY=$e
+    say "  queue  submitted${NOGATE:+ (no gate)}"
+    queue_wait "$e"
+    result=$(cat "$e/result")
+    rm -rf "$e"; QUEUE_ENTRY=
+    export_ctx "$path" "$branch"
+    case $result in
+      landed*) sha=${result#landed }; break ;;
+      empty) fail "nothing to land: the branch has no changes"; return 1 ;;
+      again|conflict)
+        again=$((again + 1))
+        [ $again -le 3 ] || { fail "could not land with the queue ($result); try again"; return 1; }
+        synced
+        merge_spending_fixes || return 1 ;;
+      *)
+        if [ -z "$fix" ] || [ $fixes -ge "$FIXES" ]; then
+          fail "the gate failed (log $log)"; return 1
+        fi
+        fixes=$((fixes + 1))
+        say "  gate   failed; fix-up $fixes of $FIXES"
+        DANGLE_T_gate_log=$log DANGLE_T_gate_tail=$(tail -n 80 "$log")
+        export DANGLE_T_gate_log DANGLE_T_gate_tail
+        run_agent "$fix" "$path" "$alog" "$(render "$(template fix-prompt.md "$DEFAULT_FIX_PROMPT")")"
+        commit_leftovers "$path"
+        synced
+        merge_spending_fixes || return 1 ;;
+    esac
+  done
+  [ -n "$plan" ] && [ "$PRIVATE" = 1 ] && done_on_disk "$plan"
+  say "  land   $(git rev-parse --short "$sha") on $BASE${REMOTE:+ (pushed to $REMOTE)}"
+  if [ -z "$keep" ]; then
+    remove_worktree "$branch" force || err "landed, but the worktree $path was not removed"
+  fi
+  return 0
+}
+
+cmd_queue() {
+  local e pid
+  pid=$(cat "$STATE/queue.lock/pid" 2>/dev/null || true)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then say "driven by pid $pid"; else say "nobody drives the queue"; fi
+  for e in $(queue_entries); do
+    say "  $(cat "$e/branch")$( [ -f "$e/nogate" ] && echo ' (no gate)')  pid $(cat "$e/pid")"
+  done
+}
+
 # land <branch> <plan file or empty> <fix spec or empty> <interactive> [keep]
+# NOW=1: the old way even under QUEUE=batch. NOGATE=1: no gate (the queue, or NOW).
+NOW=
+NOGATE=
 land() {
   local branch="$1" plan="$2" fix="$3" inter="$4" keep="${5-}" path id log alog fixes=0 tries=0 old new tree sha msg
   path=$(wt_path "$branch")
@@ -906,8 +1206,17 @@ land() {
       git -C "$path" commit -q -m "dangle: plan $id done" || fail "could not move the plan to $DONE/" || return 1
   fi
 
-  say "  gate   running (log $log)"
-  while ! run_gate "$path" "$log" "$wplan"; do
+  if [ "$QUEUE" = batch ] && [ -z "$NOW" ] && ! has_hook land; then
+    queue_land
+    return
+  fi
+
+  if [ -n "$NOGATE" ]; then
+    say "  gate   skipped (--no-gate)"
+  else
+    say "  gate   running (log $log)"
+  fi
+  while [ -z "$NOGATE" ] && ! run_gate "$path" "$log" "$wplan"; do
     if [ -z "$fix" ] || [ $fixes -ge "$FIXES" ]; then
       fail "the gate failed (log $log)"; return 1
     fi
@@ -936,11 +1245,11 @@ land() {
         [ "$inter" != 1 ] || { fail "conflicts with $BASE"; return 1; }
         merge_spending_fixes || return 1
         say "  gate   running after the merge"
-        run_gate "$path" "$log" "$wplan" || { fail "the gate failed after the merge with $BASE (log $log)"; return 1; }
+        [ -n "$NOGATE" ] || run_gate "$path" "$log" "$wplan" || { fail "the gate failed after the merge with $BASE (log $log)"; return 1; }
         take_lock "$STATE/land.lock" "another landing"
         continue
       fi
-      if [ -n "$MERGED_BY" ] || regate_needed "$old" "$new"; then
+      if [ -z "$NOGATE" ] && { [ -n "$MERGED_BY" ] || regate_needed "$old" "$new"; }; then
         say "  gate   $BASE moved; gating again"
         run_gate "$path" "$log" "$wplan" ||
           { drop_lock "$STATE/land.lock"; fail "the gate failed after $BASE moved (log $log)"; return 1; }
@@ -1022,7 +1331,10 @@ dangle: a carrot on a stick for your coding agent.
   dangle skill [--print]        install the plan-writing skill for your agents
 
   dangle new <branch> [--base B]   a worktree with .dangle/copy and the setup hook
-  dangle land [branch|id] [--fix] [--keep]   gate, squash and land a worktree
+  dangle land [branch|id] [--fix] [--keep] [--now] [--no-gate]
+                                gate, squash and land a worktree; with QUEUE=batch it joins the
+                                merge queue (--now: gate it alone, outside the queue)
+  dangle queue                  the branches waiting in the merge queue, and who drives it
   dangle rm <branch> [-f]       the teardown hook, then remove a worktree and its branch
   dangle list                   worktrees with ahead/behind and changes
   dangle path <branch|id>       print a worktree's path:  cd "$(dangle path 865)"
@@ -1039,7 +1351,8 @@ Run options:
   -y, --yes             do not ask before starting
   -q, --quiet           no art
 
-Environment: DANGLE_AGENT, DANGLE_FIX_AGENT, DANGLE_REMOTE (none = do not fetch or push).
+Environment: DANGLE_AGENT, DANGLE_FIX_AGENT, DANGLE_REMOTE (none = do not fetch or push),
+DANGLE_QUEUE (batch = the merge queue).
 Configuration: ~/.config/dangle/config (yours: AGENT=, ALIAS_), then the repository's
 .dangle/config, .dangle/copy, .dangle/hooks/*, .dangle/prompt.md (see README).
 EOF
@@ -1711,7 +2024,10 @@ cmd_land() {
   local name='' fix='' keep='' branch plan='' f spec
   [ -z "${DANGLE:-}" ] || die "refused: an agent run by dangle never lands; dangle lands this branch after you finish"
   while [ $# -gt 0 ]; do
-    case $1 in --fix) fix=1 ;; --keep) keep=1 ;; -*) die "unknown option $1" ;; *) name=$1 ;; esac
+    case $1 in
+      --fix) fix=1 ;; --keep) keep=1 ;; --now) NOW=1 ;; --no-gate) NOGATE=1 ;;
+      -*) die "unknown option $1" ;; *) name=$1 ;;
+    esac
     shift
   done
   branch=$(branch_of "$name")
@@ -1775,7 +2091,7 @@ main() {
   find_repo
   settings
   case ${1-} in
-    status|lint|doctor|init|skill|new|land|rm|list|path|audit) ;;
+    status|lint|doctor|init|skill|new|land|queue|rm|list|path|audit) ;;
     *)
       # A run keeps the computer awake for the night.
       if [ -z "${DANGLE_AWAKE:-}" ] && command -v systemd-inhibit >/dev/null 2>&1 &&
@@ -1793,6 +2109,7 @@ main() {
     skill) shift; cmd_skill "$@" ;;
     new) shift; cmd_new "$@" ;;
     land) shift; cmd_land "$@" ;;
+    queue) cmd_queue ;;
     rm) shift; cmd_rm "$@" ;;
     list) cmd_list ;;
     path) shift; cmd_path "$@" ;;

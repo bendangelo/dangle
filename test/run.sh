@@ -576,6 +576,65 @@ check "an unreachable remote says why it could not fetch" 'grep -q "could not fe
 check "the same fetch error is not repeated" '[ "$(grep -c "could not fetch" "$tmp/out")" = 1 ]'
 "$DANGLE" doctor > "$tmp/out" 2>&1
 check "doctor warns when the remote cannot be reached" 'grep -q "cannot reach origin" "$tmp/out" && grep -q "does not appear to be a git repository" "$tmp/out"'
+# The merge queue (QUEUE=batch): a landing waits in the queue; one gate runs for every branch
+# waiting, and a failed batch is split until the branch that broke it is found.
+queue_repo() { # <name> <gate script>
+  repo "$1"
+  printf 'BASE=main\nPLANS=plans\nAGENT=%s\nQUEUE=batch\nFIXES=0\n' "$tmp/agent" > .dangle/config
+  printf '%s\n' "$2" > .dangle/hooks/gate
+  printf '.gate-runs\n' > .gitignore
+  commit "queue"
+}
+branch_with() { # <branch> <file> [content]
+  "$DANGLE" new "$1" > /dev/null 2>&1
+  ( cd ".worktrees/$1" && echo "${3:-$1}" > "$2" && git add -A && git commit -qm "add $1" )
+}
+export DANGLE_QUEUE_POLL=1
+counting_gate='#!/bin/sh
+echo run >> "$DANGLE_PRIMARY/.gate-runs"
+sleep 6
+[ ! -e BAD ] || { echo "BAD file present"; exit 1; }'
+
+queue_repo queue "$counting_gate"
+branch_with qa qa.txt; branch_with qb qb.txt; branch_with qc qc.txt
+( cd .worktrees/qb && touch BAD && git add -A && git commit -qm "bad" )
+"$DANGLE" land qa > "$tmp/outa" 2>&1 & ra=$!
+sleep 1
+"$DANGLE" land qb > "$tmp/outb" 2>&1 & rb=$!
+"$DANGLE" land qc > "$tmp/outc" 2>&1 & rq=$!
+wait $ra; export rca=$?; wait $rb; export rcb=$?; wait $rq; export rcc=$?
+cat "$tmp/outa" "$tmp/outb" "$tmp/outc" > "$tmp/out"
+check "queue: the branches that waited are gated as one batch" 'grep -q "gating 2 branch(es)" "$tmp/out"'
+check "queue: a failed batch is split; the good branch lands, the bad one fails" '[ $rca = 0 ] && [ $rcc = 0 ] && [ $rcb = 1 ] && [ -f qa.txt ] && [ -f qc.txt ] && [ ! -f qb.txt ] && grep -q "the gate failed for qb" "$tmp/out" && grep -q "BAD file present" .git/dangle/logs/qb.gate.log'
+check "queue: one gate per batch, then one per half" '[ "$(wc -l < .gate-runs | tr -d " ")" = 4 ]'
+check "queue: one squashed commit per branch, pushed" '[ "$(git log --format=%s main | grep -c "^add q")" = 2 ] && [ "$(git rev-parse main)" = "$(git rev-parse origin/main)" ]'
+check "queue: the queue worktree stays; landed worktrees go" '[ -d .worktrees/dangle-queue ] && [ ! -d .worktrees/qa ] && [ -d .worktrees/qb ] && [ -z "$(ls .git/dangle/queue)" ]'
+
+queue_repo queueconflict "$counting_gate"
+branch_with qa qa.txt; branch_with qx README x; branch_with qy README y
+"$DANGLE" land qa > "$tmp/outa" 2>&1 & ra=$!
+sleep 1
+"$DANGLE" land qx > "$tmp/outb" 2>&1 & rb=$!
+sleep 0.2
+"$DANGLE" land qy > "$tmp/outc" 2>&1 & rq=$!
+wait $ra; wait $rb; export rcx=$?; wait $rq; export rcy=$?
+cat "$tmp/outa" "$tmp/outb" "$tmp/outc" > "$tmp/out"
+check "queue: a branch that conflicts with one ahead of it is handed back" '[ $rcx = 0 ] && [ $rcy = 1 ] && [ "$(cat README)" = x ] && grep -q "qy conflicts with a branch ahead of it" "$tmp/out" && grep -q "conflicts" "$tmp/outc"'
+
+queue_repo queuenogate '#!/bin/sh
+echo run >> "$DANGLE_PRIMARY/.gate-runs"; exit 1'
+branch_with rel rel.txt
+"$DANGLE" land rel --no-gate > "$tmp/out" 2>&1; export rc=$?
+check "queue: --no-gate lands through the queue without the gate" '[ $rc = 0 ] && [ -f rel.txt ] && grep -q "landing without the gate: rel" "$tmp/out" && [ ! -f .gate-runs ]'
+
+queue_repo queuerun '#!/bin/sh
+[ ! -e BAD ] || exit 1'
+plan 010-a.md a.txt
+plan 020-b.md b.txt
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
+check "queue: a run lands its plans through the queue" '[ $rc = 0 ] && [ -f a.txt ] && [ -f b.txt ] && [ -f plans/done/020-b.md ] && grep -q "queue  submitted" "$tmp/out" && git log -1 --format=%s | grep -q "^Plan 020-b.md$"'
+
 echo
 echo "$pass passed, $failed failed"
 [ $failed = 0 ]
