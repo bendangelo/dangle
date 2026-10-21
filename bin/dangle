@@ -908,7 +908,8 @@ QBUILT=
 
 # queue_submit <branch> <plan file or empty> <title or empty> <gate log> <nogate>: prints the entry.
 queue_submit() {
-  local e="$STATE/queue/$(date +%s).$$.$(printf '%s' "$1" | tr '/' '_')"
+  local e
+  e="$STATE/queue/$(date +%s).$$.$(printf '%s' "$1" | tr '/' '_')"
   mkdir -p "$e"
   printf '%s\n' "$1" > "$e/branch"
   printf '%s\n' "$2" > "$e/plan"
@@ -1105,7 +1106,7 @@ queue_push() {
       t=$(cat "$e/tree")
       [ "$t" != "$(git rev-parse "$parent^{tree}")" ] || continue
       sha=$(queue_message "$e" "$new" | git commit-tree "$t" -p "$parent") ||
-        { drop_lock "$STATE/land.lock"; for e; do queue_result "$e" again; done; return 0; }
+        { drop_lock "$STATE/land.lock"; for x; do queue_result "$x" again; done; return 0; }
       echo "$sha" > "$e/sha"
       parent=$sha
     done
