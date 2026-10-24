@@ -242,6 +242,17 @@ resolve_agent() {
 
 # ---------------------------------------------------------------- running things
 
+# stop_tree <pid>: stops a command and the processes below it. A shell waiting on a child holds
+# SIGTERM until that child exits, so a stuck agent's `sleep` would keep the log pipe open for
+# its whole nap. Signal the children first, then the shell.
+stop_tree() {
+  local pid="$1" kid kids
+  kids=$(ps -A -o pid=,ppid= 2>/dev/null | awk -v p="$pid" '$2 == p { print $1 }')
+  for kid in $kids; do stop_tree "$kid"; done
+  kill -TERM "$pid" 2>/dev/null
+  return 0
+}
+
 # run_limited <secs> <cmd...>: runs a command with a time limit. Ctrl-C stops it too.
 CHILD=
 run_limited() {
@@ -256,7 +267,7 @@ run_limited() {
     # The watcher holds no output open (a pipe after dangle would wait for it) and takes its
     # sleep with it when it is stopped.
     ( s=''; trap '[ -n "$s" ] && kill "$s" 2>/dev/null; exit 0' TERM
-      sleep "$t" & s=$!; wait "$s" && kill -TERM "$CHILD" 2>/dev/null ) < /dev/null > /dev/null 2>&1 &
+      sleep "$t" & s=$!; wait "$s" && stop_tree "$CHILD" ) < /dev/null > /dev/null 2>&1 &
     watch=$!
   fi
   echo "$CHILD" > "$STATE/child.$$"
@@ -351,7 +362,7 @@ stall_watch() {
       [ $(( $(date +%s) - since )) -ge "$STALL_SECS" ] || continue
       pid=$(cat "$STATE/child.$$" 2>/dev/null) || continue
       : > "$log.stalled"
-      kill -TERM "$pid" 2>/dev/null
+      stop_tree "$pid"
       exit 0
     done
   ) < /dev/null > /dev/null 2>&1 &
@@ -404,9 +415,9 @@ unclaim() { drop_lock "$STATE/claims/$1"; }
 
 cleanup() {
   stop_heartbeat
-  [ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null
+  [ -n "$CHILD" ] && stop_tree "$CHILD"
   # An agent started in a subshell (run_agent) records its pid here.
-  [ -f "$STATE/child.$$" ] && kill -TERM "$(cat "$STATE/child.$$")" 2>/dev/null && rm -f "$STATE/child.$$"
+  [ -f "$STATE/child.$$" ] && stop_tree "$(cat "$STATE/child.$$")" && rm -f "$STATE/child.$$"
   local d
   for d in "$STATE"/claims/*; do [ -d "$d" ] && drop_lock "$d"; done
   drop_lock "$STATE/land.lock"
