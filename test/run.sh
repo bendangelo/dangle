@@ -35,6 +35,8 @@ case $prompt in *"stopped on"*)
   git add -A && git commit -q --no-edit; exit 0 ;;
 esac
 grep -q '^Agent: idle' "$plan" && exit 0
+# "Agent: stall" works without ever committing (the stall watch stops it).
+grep -q '^Agent: stall' "$plan" && { sleep 60; exit 0; }
 f=$(sed -n 's/^Create: //p' "$plan")
 echo "made by $DANGLE_PLAN with ${DANGLE_MODEL:-?}" > "$f"
 grep -q '^Agent: broken' "$plan" && touch BAD
@@ -120,6 +122,15 @@ commit
 DANGLE_TEST_PROMPT="$tmp/prompt" "$DANGLE" -y > "$tmp/out" 2>&1
 check "the prompt describes the runner instead of saying dangle lands" '! grep -q "dangle lands" "$tmp/prompt" && grep -q "automated" "$tmp/prompt"'
 check "the prompt sends the agent to generic repository instructions" 'grep -q "CONTRIBUTING.md" "$tmp/prompt" && grep -q "project.s checks" "$tmp/prompt"'
+
+repo stall
+printf 'STALL_TIMEOUT=2s\n' >> .dangle/config
+plan 010-stuck.md a.txt 'Agent: stall'
+commit
+t0=$(date +%s)
+"$DANGLE" -y > "$tmp/out" 2>&1
+export took=$(( $(date +%s) - t0 ))
+check "an agent with no new commit for STALL_TIMEOUT is stopped" '[ $took -lt 30 ] && grep -q "stopped: no new commit in 2s" "$tmp/out" && grep -q "no new commit in 2s" .git/dangle/logs/010.log'
 
 repo deps
 plan 010-bad.md a.txt 'Agent: idle'

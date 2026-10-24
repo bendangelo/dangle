@@ -310,6 +310,7 @@ AGENT=claude:sonnet   # default: claude
 FIX_AGENT=claude:opus
 FIXES=1              # fix-up runs after a failed gate
 AGENT_TIMEOUT=4h
+STALL_TIMEOUT=60m    # stop an agent with no new commit for this long; 0 = never
 GATE_TIMEOUT=60m
 REMOTE=origin        # none: never fetch or push
 WORKTREES=.worktrees

@@ -180,6 +180,7 @@ settings() {
   AGENT_SECS=$(to_secs "$(cfg AGENT_TIMEOUT 4h)")
   GATE_SECS=$(to_secs "$(cfg GATE_TIMEOUT 60m)")
   HB_SECS=$(to_secs "$(cfg HEARTBEAT 5m)")
+  STALL_SECS=$(to_secs "$(cfg STALL_TIMEOUT 60m)")
   # QUEUE=batch: a landing joins the merge queue instead of running its own gate (queue_land).
   QUEUE=${DANGLE_QUEUE:-$(cfg QUEUE off)}
   QUEUE_BRANCH=$(cfg QUEUE_BRANCH dangle-queue)
@@ -329,6 +330,34 @@ heartbeat() {
   HB=$!
 }
 stop_heartbeat() { [ -n "$HB" ] && kill "$HB" 2>/dev/null; HB=; return 0; }
+
+# stall_watch <worktree> <log>: stops the agent when its worktree has had no new commit for
+# STALL_TIMEOUT (0 = off): an agent stuck on one failure can loop until AGENT_TIMEOUT. It leaves
+# <log>.stalled for run_agent to report. Stopped with stop_stall_watch.
+STALL=
+stall_watch() {
+  [ "$STALL_SECS" -gt 0 ] || return 0
+  local dir="$1" log="$2"
+  (
+    s=''
+    trap '[ -n "$s" ] && kill "$s" 2>/dev/null; exit 0' TERM
+    step=60; [ "$STALL_SECS" -lt $step ] && step=$STALL_SECS
+    head=$(git -C "$dir" rev-parse -q --verify HEAD 2>/dev/null); since=$(date +%s)
+    while :; do
+      sleep "$step" & s=$!
+      wait "$s" || exit 0
+      now=$(git -C "$dir" rev-parse -q --verify HEAD 2>/dev/null)
+      if [ "$now" != "$head" ]; then head=$now; since=$(date +%s); continue; fi
+      [ $(( $(date +%s) - since )) -ge "$STALL_SECS" ] || continue
+      pid=$(cat "$STATE/child.$$" 2>/dev/null) || continue
+      : > "$log.stalled"
+      kill -TERM "$pid" 2>/dev/null
+      exit 0
+    done
+  ) < /dev/null > /dev/null 2>&1 &
+  STALL=$!
+}
+stop_stall_watch() { [ -n "$STALL" ] && kill "$STALL" 2>/dev/null; STALL=; return 0; }
 
 # hook <name> <dir> [args...]: runs .dangle/hooks/<name> in <dir> if it exists.
 hook() {
@@ -670,8 +699,12 @@ Implement the plan in {{plan}}. Read it in full first, then follow the repositor
 instructions and conventions (for example AGENTS.md, CLAUDE.md, CONTRIBUTING.md, README,
 and any files the plan names).
 
-- Commit your work on this branch as you go, following the repository'"'"'s commit style.
-  Earlier work may already be committed here: continue from it.
+- Commit your work on this branch as you go, new files too, following the repository'"'"'s
+  commit style. Earlier work may already be committed here: continue from it.
+- Do only this plan: what it leaves to another plan stays out.
+- A failure your change only nudges (a stack overflow, a timeout, a flaky test): give it 30
+  minutes at most, then commit and say what you found in your last message.
+- Build no second checkout or copy of the repository.
 - Do not merge, push, rebase, switch branches, or move or edit the plan file. An automated
   runner integrates this branch after you finish, and only if the project'"'"'s checks pass.
 - Before you stop, run the project'"'"'s checks and make them pass: {{gate}}
@@ -730,6 +763,8 @@ run_agent() {
   say "  agent  $AGENT_LABEL  (log $log)"
   printf '\n=== %s  %s ===\n' "$(date)" "$AGENT_LABEL" >> "$log"
   if [ "${FOLLOW:-0}" = 1 ]; then tail -n 0 -f "$log" & tailer=$!; else heartbeat agent "$log"; fi
+  rm -f "$log.stalled"
+  stall_watch "$dir" "$log"
   (
     cd "$dir" || exit 1
     set -f; set -- $AGENT_CMD; set +f
@@ -746,8 +781,15 @@ run_agent() {
   rc=$?
   rm -f "$log.rc"
   stop_heartbeat
+  stop_stall_watch
   [ -n "$tailer" ] && kill "$tailer" 2>/dev/null
-  [ $rc = 124 ] && say "  agent  stopped after $(cfg AGENT_TIMEOUT 4h)"
+  if [ -f "$log.stalled" ]; then
+    rm -f "$log.stalled"
+    say "  agent  stopped: no new commit in $(cfg STALL_TIMEOUT 60m)"
+    printf 'dangle: stopped, no new commit in %s\n' "$(cfg STALL_TIMEOUT 60m)" >> "$log"
+  elif [ $rc = 124 ]; then
+    say "  agent  stopped after $(cfg AGENT_TIMEOUT 4h)"
+  fi
   return $rc
 }
 
@@ -1874,6 +1916,8 @@ DONE=done
 # Fix-up runs after a failed gate (0 = none).
 FIXES=1
 AGENT_TIMEOUT=4h
+# An agent with no new commit for this long is stopped (0 = never).
+STALL_TIMEOUT=60m
 GATE_TIMEOUT=60m
 # Short names for -a:  dangle -a cheap
 # ALIAS_cheap=claude:haiku
