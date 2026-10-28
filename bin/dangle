@@ -2151,8 +2151,8 @@ main() {
     *)
       # A run keeps the computer awake for the night.
       if [ -z "${DANGLE_AWAKE:-}" ] && command -v systemd-inhibit >/dev/null 2>&1 &&
-        systemd-inhibit --what=sleep:idle --who=dangle --why=check true 2>/dev/null; then
-        DANGLE_AWAKE=1 exec systemd-inhibit --what=sleep:idle --who=dangle --why="running plans" "$0" "$@"
+        systemd-inhibit --no-ask-password --what=sleep:idle --who=dangle --why=check true 2>/dev/null; then
+        DANGLE_AWAKE=1 exec systemd-inhibit --no-ask-password --what=sleep:idle --who=dangle --why="running plans" "$0" "$@"
       fi ;;
   esac
   case ${1-} in
