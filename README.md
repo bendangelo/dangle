@@ -243,6 +243,7 @@ node_modules into new worktrees" or "land through a GitHub PR and wait for CI".
 | `hooks/regate <old> <new>` | the base moved during a gate | exit 1 = no second gate (e.g. only docs changed) |
 | `hooks/land` | landing, after the gate | replaces the built-in squash-and-push |
 | `hooks/teardown` | before a worktree is removed | save a build cache for the next one |
+| `hooks/prune <worktree> <days>` | `dangle prune`, and the start and end of a run | free the disk a worktree is holding: drop build output and caches, keep what a rebuild needs (see below) |
 | `audit-prompt.md` | `dangle audit` | the audit prompt, with `{{plan}}` |
 | `hooks/lint <plans>` | `dangle lint` | your own plan checks (skill names exist, no forbidden commands); exit non-zero = error |
 | `hooks/done <summary>` | end of a run | notify yourself: `notify-send`, ntfy, e-mail |
@@ -250,6 +251,38 @@ node_modules into new worktrees" or "land through a GitHub PR and wait for CI".
 
 Hooks run with `DANGLE_PRIMARY` (the main checkout), `DANGLE_WORKTREE`, `DANGLE_BRANCH`,
 `DANGLE_BASE`, and for `land`, `DANGLE_TITLE`, `DANGLE_MESSAGE_FILE` and `DANGLE_REMOTE`.
+`hooks/prune` also gets `DANGLE_PRUNE_DAYS` and `DANGLE_PRUNE_REASON` (`idle`, `size` or
+`all`).
+
+### Disk: worktrees are build output too
+
+Every worktree builds into its own directory, so agents never share a lock. The cost is disk:
+a `target/`, `node_modules/` or `.venv/` per worktree, and nothing ever collects them. dangle
+does not know which files are disposable, so the project says so in `hooks/prune`:
+
+```sh
+#!/bin/sh
+# .dangle/hooks/prune <worktree> <idle-days>: keep what makes a rebuild cheap, drop the rest.
+cd "$DANGLE_WORKTREE" || exit 0
+[ -d target ] || exit 0
+cargo clean -p my-crate 2>/dev/null   # or any cache your build system can regenerate
+```
+
+dangle calls it, before and after every run, for each worktree that
+
+- has no uncommitted changes (in tracked files), and
+- was last used at least `PRUNE_DAYS` days ago (default 3), or is larger than `PRUNE_MAX_GB`
+  GB (default 0: no size cap).
+
+It never touches a worktree whose plan another dangle is running, one a landing holds, the
+merge queue while it gates, or the worktree you are standing in. `dangle prune` does the same
+by hand (`-n` shows what it would do, `--all` ignores the age and size, `--days` and
+`--max-gb` override the config); `dangle prune --rm` also removes plan worktrees that have no
+commits of their own and no uncommitted files. `dangle list` shows each worktree's size.
+
+This is housekeeping, never a verdict: a failing prune hook is reported and the run goes on.
+The project decides the scope, and because only the worktree is pruned, a later run resumes
+with a slower build, never with lost source.
 
 ### The merge queue: one gate for every branch waiting
 
@@ -296,7 +329,8 @@ dangle new my-fix              # .worktrees/my-fix, with copy + setup
 cd "$(dangle path my-fix)"
 dangle land                    # gate, squash, land, remove (--keep keeps it, --fix asks the agent)
 dangle queue                   # with QUEUE=batch: the branches waiting to be gated together
-dangle list                    # worktrees, ahead/behind, changes
+dangle list                    # worktrees, ahead/behind, size, changes
+dangle prune                   # run hooks/prune in the idle worktrees; -n first, --rm to drop empty ones
 dangle rm my-fix               # teardown, then remove
 ```
 
@@ -317,6 +351,8 @@ WORKTREES=.worktrees
 BRANCH_PREFIX=plan-
 MAX_LINES=300
 HEARTBEAT=5m         # a progress line while an agent or the gate runs; 0 = off
+PRUNE_DAYS=3         # prune worktrees idle for this long at the start and end of a run; 0 = off
+PRUNE_MAX_GB=0       # also prune worktrees larger than this; 0 = no size cap
 QUEUE=batch          # landings share one gate (the merge queue); default: off
 QUEUE_BRANCH=dangle-queue
 ALIAS_cheap=claude:haiku

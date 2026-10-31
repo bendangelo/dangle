@@ -646,6 +646,56 @@ commit
 "$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
 check "queue: a run lands its plans through the queue" '[ $rc = 0 ] && [ -f a.txt ] && [ -f b.txt ] && [ -f plans/done/020-b.md ] && grep -q "queue  submitted" "$tmp/out" && git log -1 --format=%s | grep -q "^Plan 020-b.md$"'
 
+# ---------------------------------------------------------------- disk
+# A kept worktree is build output nobody is using: dangle prunes it (with the project's
+# prune hook) when it has been idle long enough, is too big, or `dangle prune --rm` finds it
+# with no work of its own. It never touches a worktree in use or with changes.
+repo prune
+printf 'PRUNE_DAYS=1\n' >> .dangle/config
+cat > .dangle/hooks/prune <<'EOF'
+#!/bin/sh
+printf '%s %s %s\n' "$DANGLE_BRANCH" "$DANGLE_PRUNE_DAYS" "$DANGLE_PRUNE_REASON" >> "$DANGLE_PRIMARY/pruned"
+rm -rf junk
+EOF
+chmod +x .dangle/hooks/prune
+printf 'junk/\n' > .gitignore
+plan 010-stuck.md a.txt 'Agent: idle'
+commit
+"$DANGLE" -y 010 > "$tmp/out" 2>&1
+mkdir -p .worktrees/plan-010/junk && echo x > .worktrees/plan-010/junk/x
+touch -t 202001010000 .git/dangle/results/010
+
+"$DANGLE" prune -n > "$tmp/out" 2>&1
+check "prune -n shows an idle worktree and its size, without running the hook" \
+  'grep -q "would prune plan-010 (idle, " "$tmp/out" && [ ! -f pruned ]'
+
+"$DANGLE" prune > "$tmp/out" 2>&1
+check "prune runs the hook with the days and the reason" \
+  'grep -q "^plan-010 1 idle$" pruned && [ ! -d .worktrees/plan-010/junk ]'
+check "prune says what it freed" 'grep -q "pruned 1 worktree(s)" "$tmp/out"'
+
+printf 'wip\n' >> .worktrees/plan-010/README
+"$DANGLE" prune --all > "$tmp/out" 2>&1
+check "prune leaves a worktree with uncommitted changes alone" 'grep -q "skip     plan-010" "$tmp/out"'
+git -C .worktrees/plan-010 checkout -q -- README
+
+plan 020-next.md b.txt
+commit "plan 020"
+"$DANGLE" -y 020 > "$tmp/out" 2>&1
+check "a run prunes idle worktrees before it starts" \
+  'grep -q "pruning  plan-010 (idle)" "$tmp/out" && [ "$(grep -c "^plan-010 " pruned)" -ge 2 ]'
+
+"$DANGLE" prune --rm --all > "$tmp/out" 2>&1
+check "prune --rm removes a plan worktree with no commits of its own" \
+  '[ ! -d .worktrees/plan-010 ] && grep -q "removed  plan-010" "$tmp/out"'
+
+repo prune-nohook
+plan 010-stuck.md a.txt 'Agent: idle'
+commit
+"$DANGLE" -y 010 > "$tmp/out" 2>&1
+"$DANGLE" prune > "$tmp/out" 2>&1
+check "prune without a hook says where the policy lives" 'grep -q "no .dangle/hooks/prune" "$tmp/out"'
+
 echo
 echo "$pass passed, $failed failed"
 [ $failed = 0 ]
