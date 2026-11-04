@@ -704,7 +704,7 @@ printf '# parked\n' > plans/hold/020-parked.md
 commit
 f=$("$DANGLE" add next-thing "Next thing" 2> "$tmp/out")
 check "add takes one past the highest id in every folder" \
-  '[ "$f" = "$PWD/plans/031-next-thing.md" ] && [ "$(head -n 1 "$f")" = "# Next thing" ]'
+  '[ "${f##*/}" = 031-next-thing.md ] && [ "$f" -ef plans/031-next-thing.md ] && [ "$(head -n 1 "$f")" = "# Next thing" ]'
 f2=$("$DANGLE" add second 2>/dev/null)
 check "a second add takes the next number, even before the first is committed" \
   '[ "${f2##*/}" = "032-second.md" ] && grep -q "^# second$" "$f2"'
