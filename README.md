@@ -78,6 +78,12 @@ Done when: `cargo test payroll_employee`
   without a number goes by its name after the date, and its first words work too: `shop-A1`
   names `2026-10-12-shop-A1-report-links.md` (never `shop-A10-…`), on the command line and in
   `depends=`.
+- `dangle add <short-name> "<title>"` makes the next plan file and prints its path: the number
+  is one past the highest anywhere (every folder, the base branch, the remote's base branch),
+  taken under a lock and the file created at once, so two agents writing plans at the same
+  time never take the same number. A date prefix is added when the repository's plans use one.
+  `dangle lint` fails on an active plan whose id another active or landed plan has, and warns
+  when a parked one has it.
 - `depends=` holds a plan back until those plans have landed (a dependency that fails holds it
   for the night). `agent=` picks the agent for it.
 - `Done when:` is a command dangle runs after the gate; the plan lands only when it passes.

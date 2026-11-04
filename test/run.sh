@@ -696,6 +696,41 @@ commit
 "$DANGLE" prune > "$tmp/out" 2>&1
 check "prune without a hook says where the policy lives" 'grep -q "no .dangle/hooks/prune" "$tmp/out"'
 
+repo add-ids
+plan 010-one.md one.txt
+mkdir -p plans/done plans/hold
+printf '# old\n' > plans/done/030-old.md
+printf '# parked\n' > plans/hold/020-parked.md
+commit
+f=$("$DANGLE" add next-thing "Next thing" 2> "$tmp/out")
+check "add takes one past the highest id in every folder" \
+  '[ "$f" = "$PWD/plans/031-next-thing.md" ] && [ "$(head -n 1 "$f")" = "# Next thing" ]'
+f2=$("$DANGLE" add second 2>/dev/null)
+check "a second add takes the next number, even before the first is committed" \
+  '[ "${f2##*/}" = "032-second.md" ] && grep -q "^# second$" "$f2"'
+git clone -q -b main "$tmp/add-ids.git" "$tmp/add-other" && (cd "$tmp/add-other" &&
+  printf '# theirs\n' > plans/040-theirs.md && git add -A && git commit -qm theirs && git push -q origin main)
+git fetch -q origin
+f3=$("$DANGLE" add after-remote 2>/dev/null)
+check "add counts the plans another computer pushed" '[ "${f3##*/}" = "041-after-remote.md" ]'
+"$DANGLE" add a > /dev/null 2>&1 & "$DANGLE" add b > /dev/null 2>&1 & wait
+check "two adds at once take two numbers" \
+  '{ [ -f plans/042-a.md ] && [ -f plans/043-b.md ]; } || { [ -f plans/042-b.md ] && [ -f plans/043-a.md ]; }'
+"$DANGLE" add 'bad name' > "$tmp/out" 2>&1
+check "add refuses a name with a space" 'grep -q "a plan name is" "$tmp/out"'
+printf '# dup\n' > plans/030-dup.md
+printf '# dup2\n' > plans/020-dup2.md
+"$DANGLE" lint > "$tmp/out" 2>&1
+check "lint fails an active plan with a landed plan's id" 'grep -q "id 030 is a landed plan" "$tmp/out"'
+check "lint warns of an active plan with a parked plan's id" 'grep -q "id 020 is also a parked" "$tmp/out"'
+
+repo add-dated
+printf '# a\n' > plans/2026-01-01-0099-a.md
+commit
+f=$("$DANGLE" add b 2>/dev/null)
+check "add keeps the date prefix and the number's width" \
+  '[ "${f##*/}" = "$(date +%F)-0100-b.md" ]'
+
 echo
 echo "$pass passed, $failed failed"
 [ $failed = 0 ]

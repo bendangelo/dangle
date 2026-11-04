@@ -18,8 +18,11 @@ does it land. Subfolders are inactive: `done/` holds landed plans, and any other
 ## Writing a plan
 
 - **File name:** `NNN-short-name.md`, or with a date `YYYY-MM-DD-NNN-short-name.md`. The number
-  is the id (`dangle 865`), and the order of the names is the run order. Use the next free
-  number; leave gaps when you might insert plans later. `dangle --dry-run` prints the order.
+  is the id (`dangle 865`), and the order of the names is the run order. Make the file with
+  `dangle add <short-name> "<title>"`: it takes the next free number (every folder, the base
+  branch and the remote's) under a lock, creates the file at once and prints its path, so two
+  sessions writing plans at the same time never share a number. Then write into that file.
+  `dangle --dry-run` prints the order.
 - **One goal.** A plan is one change a single agent session can finish: about 3 to 8 files.
   Two goals make two plans. Aim for 100 to 300 lines (`MAX_LINES`, warned by `dangle lint`).
 - **Header** (optional), on one line under the title:

@@ -1536,6 +1536,8 @@ dangle: a carrot on a stick for your coding agent.
   dangle [ids...] [options]     run the active plans in order (or only these ids)
   dangle status                 every active plan: ready, waiting, running, failed
   dangle lint                   check the active plans (size, ids, dependencies)
+  dangle add <name> [title]     make the next plan file (the next free number, taken under a
+                                lock so two sessions never share one) and print its path
   dangle audit [ids] [--apply]  ask the agent which plans are already implemented (read-only);
                                 --apply moves those to the done folder in one commit
   dangle doctor [--agent]       check the setup (--agent also asks the agent to reply)
@@ -1904,9 +1906,15 @@ cmd_status() {
 cmd_lint() {
   local f id lines ids='' errors=0 warnings=0 d all
   all=$( { for f in $(plan_files); do plan_id "$f"; done; landed_ids; } | sort -u)
+  local landed parked
+  landed=" $(landed_ids | tr '\n' ' ') "
+  parked=" $(find "$PRIMARY/$PLANS" -mindepth 2 -name '*.md' ! -path "*/$DONE/*" 2>/dev/null |
+    while read -r d; do plan_id "$d"; done | tr '\n' ' ') "
   for f in $(plan_files); do
     id=$(plan_id "$f")
     case " $ids " in *" $id "*) err "${f##*/}: id $id is used by another plan"; errors=$((errors + 1)) ;; esac
+    case $landed in *" $id "*) err "${f##*/}: id $id is a landed plan's; take a new one (dangle add)"; errors=$((errors + 1)) ;; esac
+    case $parked in *" $id "*) say "warning: ${f##*/}: id $id is also a parked plan's"; warnings=$((warnings + 1)) ;; esac
     ids="$ids $id"
     lines=$(wc -l < "$f" | tr -d ' ')
     [ "$lines" -le "$MAX_LINES" ] || { say "warning: ${f##*/}: $lines lines (MAX_LINES=$MAX_LINES); split it?"; warnings=$((warnings + 1)); }
@@ -2157,8 +2165,11 @@ does it land. Subfolders are inactive: `done/` holds landed plans, and any other
 ## Writing a plan
 
 - **File name:** `NNN-short-name.md`, or with a date `YYYY-MM-DD-NNN-short-name.md`. The number
-  is the id (`dangle 865`), and the order of the names is the run order. Use the next free
-  number; leave gaps when you might insert plans later. `dangle --dry-run` prints the order.
+  is the id (`dangle 865`), and the order of the names is the run order. Make the file with
+  `dangle add <short-name> "<title>"`: it takes the next free number (every folder, the base
+  branch and the remote's) under a lock, creates the file at once and prints its path, so two
+  sessions writing plans at the same time never share a number. Then write into that file.
+  `dangle --dry-run` prints the order.
 - **One goal.** A plan is one change a single agent session can finish: about 3 to 8 files.
   Two goals make two plans. Aim for 100 to 300 lines (`MAX_LINES`, warned by `dangle lint`).
 - **Header** (optional), on one line under the title:
@@ -2239,6 +2250,41 @@ cmd_new() {
   [ -n "$branch" ] || die "usage: dangle new <branch> [--base <branch>]"
   new_worktree "$branch" "${from:-$BASE}" || exit 1
   wt_path "$branch"; echo
+}
+
+# every_plan_name: the file name of every plan anywhere: the plans folder and its subfolders on
+# disk (written but not committed yet), the base branch, and the remote's base branch (another
+# computer's). One per line, duplicates kept.
+every_plan_name() {
+  find "$PRIMARY/$PLANS" -name '*.md' 2>/dev/null
+  git ls-tree -r --name-only "refs/heads/$BASE" -- "$PLANS" 2>/dev/null
+  [ -z "$REMOTE" ] || git ls-tree -r --name-only "refs/remotes/$REMOTE/$BASE" -- "$PLANS" 2>/dev/null
+}
+
+# cmd_add <short-name> [title...]: makes the next plan file and prints its path. The number is
+# one past the highest anywhere (every_plan_name), taken under a lock and the file created at
+# once, so two sessions writing plans at the same time never pick the same number.
+cmd_add() {
+  local name=${1-} title nums top width next dated='' f
+  [ -n "$name" ] || die "usage: dangle add <short-name> [title]"
+  shift
+  case $name in *[!A-Za-z0-9._-]*|-*) die "a plan name is letters, digits, '.', '_' and '-' (got $name)" ;; esac
+  title=${*:-$(printf '%s' "$name" | tr '-' ' ')}
+  mkdir -p "$PRIMARY/$PLANS"
+  take_lock "$STATE/add.lock" "another dangle add" >&2
+  nums=$(every_plan_name | sed 's|.*/||' | grep '\.md$' | while read -r f; do plan_id "$f"; done |
+    grep -E '^[0-9]+$' || true)
+  top=$(printf '%s\n' "$nums" | sed 's/^0*\([0-9]\)/\1/' | sort -n | tail -n 1)
+  width=$(printf '%s\n' "$nums" | awk '{ if (length($0) > w) w = length($0) } END { print w + 0 }')
+  next=$(printf "%0${width:-1}d" $(( ${top:-0} + 1 )))
+  every_plan_name | sed 's|.*/||' | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}-' && dated="$(date +%F)-"
+  f="$PRIMARY/$PLANS/$dated$next-$name.md"
+  if ! ( set -C; printf '# %s\n\n' "$title" > "$f" ) 2>/dev/null; then
+    drop_lock "$STATE/add.lock"
+    die "${f##*/} exists already"
+  fi
+  drop_lock "$STATE/add.lock"
+  say "$f"
 }
 
 cmd_land() {
@@ -2342,7 +2388,7 @@ main() {
   find_repo
   settings
   case ${1-} in
-    status|lint|doctor|init|skill|new|land|queue|rm|prune|list|path|audit) ;;
+    status|lint|doctor|init|skill|new|land|queue|rm|prune|list|path|audit|add) ;;
     *)
       # A run keeps the computer awake for the night.
       if [ -z "${DANGLE_AWAKE:-}" ] && command -v systemd-inhibit >/dev/null 2>&1 &&
@@ -2355,6 +2401,7 @@ main() {
     status) cmd_status ;;
     audit) shift; cmd_audit "$@" ;;
     lint) cmd_lint ;;
+    add) shift; cmd_add "$@" ;;
     doctor) shift; cmd_doctor "$@" ;;
     init) cmd_init ;;
     skill) shift; cmd_skill "$@" ;;
