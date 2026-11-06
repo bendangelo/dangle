@@ -409,7 +409,9 @@ repo inside
 check "dangle land from inside the worktree keeps the shell's directory" '[ $rc = 0 ] && [ -f .worktrees/fix-typo/cwd-ok ]'
 check "dangle land from inside still removes the worktree and its branch" '[ ! -e .worktrees/fix-typo/.git ] && [ -z "$(git worktree list | grep fix-typo)" ] && [ -z "$(git branch --list fix-typo)" ]'
 check "a branch of one commit lands under that commit's subject" '[ "$(git log -1 --format=%s main)" = "Fix the typo" ]'
-( cd .worktrees/fix-typo && sleep 5 ) & holder=$!
+# exec, so the holder pid is the sleeper itself: kill must end the process whose cwd is in the tombstone
+# (a plain subshell leaves sleep as an orphan on shells that do not exec it, as macOS's /bin/sh does not).
+( cd .worktrees/fix-typo && exec sleep 5 ) & holder=$!
 sleep 1
 "$DANGLE" list > "$tmp/out" 2>&1
 check "a placeholder another shell stands in is left alone" '[ -d .worktrees/fix-typo ]'
