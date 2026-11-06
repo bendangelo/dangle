@@ -404,9 +404,25 @@ check "a plan that needs a later-numbered one runs after it, the same night" '[ 
 
 repo inside
 "$DANGLE" new fix-typo > "$tmp/out" 2>&1
-( cd .worktrees/fix-typo && echo typo > typo.txt && git add -A && git commit -qm "Fix the typo" && "$DANGLE" land ) > "$tmp/out" 2>&1; rc=$?
-check "dangle land from inside the worktree removes it and its branch" '[ $rc = 0 ] && [ ! -d .worktrees/fix-typo ] && [ -z "$(git branch --list fix-typo)" ]'
+( cd .worktrees/fix-typo && echo typo > typo.txt && git add -A && git commit -qm "Fix the typo" &&
+  "$DANGLE" land && [ -d "$PWD" ] && echo ok > cwd-ok ) > "$tmp/out" 2>&1; rc=$?
+check "dangle land from inside the worktree keeps the shell's directory" '[ $rc = 0 ] && [ -f .worktrees/fix-typo/cwd-ok ]'
+check "dangle land from inside still removes the worktree and its branch" '[ ! -e .worktrees/fix-typo/.git ] && [ -z "$(git worktree list | grep fix-typo)" ] && [ -z "$(git branch --list fix-typo)" ]'
 check "a branch of one commit lands under that commit's subject" '[ "$(git log -1 --format=%s main)" = "Fix the typo" ]'
+( cd .worktrees/fix-typo && sleep 5 ) & holder=$!
+sleep 1
+"$DANGLE" list > "$tmp/out" 2>&1
+check "a placeholder another shell stands in is left alone" '[ -d .worktrees/fix-typo ]'
+kill $holder 2>/dev/null; wait $holder 2>/dev/null
+"$DANGLE" list > "$tmp/out" 2>&1
+check "the next dangle command from outside removes the empty placeholder" '[ ! -d .worktrees/fix-typo ]'
+
+"$DANGLE" new deep > "$tmp/out" 2>&1
+( cd .worktrees/deep && mkdir sub && echo deep > deep.txt && git add -A && git commit -qm "Add deep" &&
+  cd sub && "$DANGLE" land && [ -d "$PWD" ] && echo ok > cwd-ok ) > "$tmp/out" 2>&1; rc=$?
+check "a landing from a subdirectory keeps that directory too" '[ $rc = 0 ] && [ -f .worktrees/deep/sub/cwd-ok ] && [ ! -e .worktrees/deep/deep.txt ] && [ -f .worktrees/deep/.dangle-landed ]'
+"$DANGLE" list > "$tmp/out" 2>&1
+check "the placeholder with a subdirectory goes too" '[ ! -d .worktrees/deep ]'
 
 repo parallel
 plan 010-a.md a.txt

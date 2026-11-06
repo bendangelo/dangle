@@ -340,6 +340,11 @@ dangle prune                   # run hooks/prune in the idle worktrees; -n first
 dangle rm my-fix               # teardown, then remove
 ```
 
+Landing from inside the worktree (the usual way) empties it but leaves an empty placeholder
+for the shell's working directory: a child process cannot move the shell, and deleting the
+directory it stands in makes the next prompt warn (`mise` does). The next dangle command run
+from outside removes the placeholder.
+
 ## Configuration
 
 ```sh

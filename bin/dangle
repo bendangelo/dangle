@@ -11,6 +11,10 @@ LC_ALL=C
 export LC_ALL
 VERSION=0.1.24
 
+# The shell's directory when dangle started. remove_worktree must not delete it: a child cannot
+# move its parent shell, so a deleted cwd makes the next prompt warn (mise, for one).
+START_DIR=$(pwd -P 2>/dev/null || printf '%s' "${PWD:-}")
+
 # ---------------------------------------------------------------- output
 
 say() { printf '%s\n' "$*"; }
@@ -544,11 +548,78 @@ copy_into() {
   done < "$DOT/copy"
 }
 
+# caller_inside <dir>: 0 when the shell that started dangle stands in <dir> or below it.
+caller_inside() {
+  local real
+  real=$(cd "$1" 2>/dev/null && pwd -P) || return 1
+  case "$START_DIR/" in "$real"/*) return 0 ;; esac
+  return 1
+}
+
+# dir_in_use <dir>: 0 when any live process stands in <dir> or below it.
+dir_in_use() {
+  local real p cwd
+  real=$(cd "$1" 2>/dev/null && pwd -P) || return 1
+  if [ -d /proc ]; then
+    for p in /proc/[0-9]*/cwd; do
+      cwd=$(readlink "$p" 2>/dev/null) || continue
+      case "$cwd/" in "$real"/*) return 0 ;; esac
+    done
+    return 1
+  fi
+  command -v lsof >/dev/null 2>&1 || return 1
+  lsof -a -d cwd -Fn 2>/dev/null | awk -v d="$real/" '
+    /^n/ { if (index(substr($0, 2) "/", d) == 1) found = 1 }
+    END { exit(found ? 0 : 1) }'
+}
+
+# remove_worktree_here <path>: empty a worktree that the caller's shell stands in (or in a
+# subdirectory of). A child cannot move its parent shell, so deleting the directory would leave
+# the shell in a cwd that no longer exists and the next prompt would warn (mise does). The .git
+# link goes, so `git worktree prune` drops the registration, but the directories from the root
+# down to the shell's cwd stay. The empty tree is a tombstone: clear_tombstones removes it once
+# nobody stands in it.
+remove_worktree_here() {
+  local path="$1" real rel cur part
+  real=$(cd "$path" && pwd -P) || return 1
+  rel=${START_DIR#"$real"}
+  rm -rf -- "$path/.git"
+  cur="$path"
+  while [ -n "$rel" ]; do
+    rel=${rel#/}
+    part=${rel%%/*}
+    if [ "$part" = "$rel" ]; then rel=''; else rel=${rel#*/}; fi
+    find "$cur" -mindepth 1 -maxdepth 1 ! -name "$part" -exec rm -rf -- {} +
+    cur="$cur/$part"
+  done
+  find "$cur" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  : > "$path/.dangle-landed"
+  say "  note   your shell is in $path; the worktree is empty now, and the next dangle run from outside removes it"
+}
+
+# clear_tombstones: remove the empty placeholders a landing left in the directory a shell stood
+# in, once that shell has moved on.
+clear_tombstones() {
+  local d
+  [ -d "$PRIMARY/$WORKTREES" ] || return 0
+  for d in "$PRIMARY/$WORKTREES"/*; do
+    [ -d "$d" ] && [ -f "$d/.dangle-landed" ] || continue
+    { caller_inside "$d" || dir_in_use "$d"; } && continue
+    rm -rf -- "$d"
+  done
+  return 0
+}
+
 # new_worktree <branch> [base]: creates (or re-opens) the branch's worktree, copies the
 # files in .dangle/copy, runs the setup hook.
 new_worktree() {
   local branch="$1" from="${2:-$BASE}" path
   path=$(wt_path "$branch")
+  if [ -f "$path/.dangle-landed" ]; then
+    caller_inside "$path" &&
+      die "$path is an empty leftover of a landed worktree and your shell is in it; cd out first"
+    rm -rf -- "$path"
+  fi
   [ -e "$path" ] && die "$path already exists"
   ensure_excluded
   mkdir -p "$(dirname "$path")"
@@ -570,14 +641,19 @@ new_worktree() {
 
 # remove_worktree <branch> [force]: runs the teardown hook, removes the worktree and branch.
 remove_worktree() {
-  local branch="$1" force="${2-}" path
+  local branch="$1" force="${2-}" path here=0
   path=$(wt_path "$branch")
+  caller_inside "$path" && here=1
   # The caller may be standing in the worktree that is about to go.
   cd "$PRIMARY" || return 1
   if [ -d "$path" ]; then
     export_ctx "$path" "$branch"
     hook teardown "$path" || err "the teardown hook failed (going on)"
-    git worktree remove ${force:+--force} "$path" || return 1
+    if [ "$here" = 1 ]; then
+      remove_worktree_here "$path" || return 1
+    else
+      git worktree remove ${force:+--force} "$path" || return 1
+    fi
   fi
   git worktree prune
   if git show-ref -q --verify "refs/heads/$branch"; then
@@ -2387,6 +2463,7 @@ main() {
   [ "${1-} ${2-}" = "skill --print" ] && { skill_text; return 0; }
   find_repo
   settings
+  clear_tombstones
   case ${1-} in
     status|lint|doctor|init|skill|new|land|queue|rm|prune|list|path|audit|add) ;;
     *)
