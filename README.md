@@ -137,18 +137,20 @@ printed last (`HEARTBEAT=5m`, `0` turns it off):
 For each plan dangle creates the worktree `.worktrees/plan-<id>` from the base branch, runs
 the agent, commits anything it left uncommitted, merges the base branch in, moves the plan to
 `done/` in the branch, and runs the gate. A failed gate gets one fix-up run of the agent
-(`FIXES=`) with the gate's output. Then, under a lock, it lands: squashes the branch onto the
-base branch and pushes it. A plan that fails keeps its worktree for you to look at.
+(`FIXES=`) with the gate's output: `FIX_AGENT=` (or `--fix-agent`) can name a stronger agent
+for the fix-up, and defaults to the plan's agent. Then, under a lock, it lands: squashes the
+branch onto the base branch and pushes it. A plan that fails keeps its worktree for you to
+look at.
 
 A merge of the base branch that conflicts does not end the plan. Where both sides only added
 lines at the same place (two plans adding to one list, `match` or doc section), dangle keeps
 both, the base's lines first, and the gate checks the result (unless the base also added one of
-the branch's lines to that file, which would list it twice). Any other conflict goes to the
-agent with `merge-prompt.md`, which spends one of the `FIXES`; it counts only when the merge is
-committed with no conflict marker left, and is undone otherwise. A conflict found while landing
-lets go of the lock first, so no other landing waits on the agent, and the gate runs again
-before the branch lands. `dangle land` by hand settles the added-lines kind too and leaves any
-other conflict for you.
+the branch's lines to that file, which would list it twice). Any other conflict goes to the fix
+agent (`FIX_AGENT=`, or `--fix-agent`; default the plan's agent) with `merge-prompt.md`, which
+spends one of the `FIXES`; it counts only when the merge is committed with no conflict marker
+left, and is undone otherwise. A conflict found while landing lets go of the lock first, so no
+other landing waits on the agent, and the gate runs again before the branch lands. `dangle land`
+by hand settles the added-lines kind too and leaves any other conflict for you.
 
 ### One plan at a time, more runners when you want them
 
@@ -333,7 +335,8 @@ dangle's worktrees work for people too:
 ```sh
 dangle new my-fix              # .worktrees/my-fix, with copy + setup
 cd "$(dangle path my-fix)"
-dangle land                    # gate, squash, land, remove (--keep keeps it, --fix asks the agent)
+dangle land                    # gate, squash, land, remove (--keep keeps it, --fix asks the agent;
+                               #   --fix-agent SPEC picks a stronger one for the fix-up)
 dangle queue                   # with QUEUE=batch: the branches waiting to be gated together
 dangle list                    # worktrees, ahead/behind, size, changes
 dangle prune                   # run hooks/prune in the idle worktrees; -n first, --rm to drop empty ones
@@ -352,7 +355,7 @@ BASE=main            # the branch plans land on (default: origin's HEAD, main, m
 PLANS=docs/plans     # the plans folder
 DONE=done            # landed plans move to PLANS/DONE
 AGENT=claude:sonnet   # default: claude
-FIX_AGENT=claude:opus
+FIX_AGENT=claude:opus  # fix-ups after a failed gate or merge conflict (default: AGENT)
 FIXES=1              # fix-up runs after a failed gate
 AGENT_TIMEOUT=4h
 STALL_TIMEOUT=60m    # stop an agent with no new commit for this long; 0 = never

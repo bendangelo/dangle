@@ -170,6 +170,36 @@ commit
 "$DANGLE" -y > "$tmp/out" 2>&1
 check "a failed gate gets a fix-up and lands" '[ -f x.txt ] && [ ! -f BAD ] && grep -q "fix-up 1" "$tmp/out"'
 
+# A fix agent is optional: unset, fix-ups use the plan's agent (above); set, they use it.
+cat > "$tmp/fixagent" <<EOF
+#!/bin/sh
+echo used >> "$tmp/fix-used"
+exec "$tmp/agent" "\$@"
+EOF
+chmod +x "$tmp/fixagent"
+
+repo fixagent-merge
+rm -f "$tmp/fix-used"
+printf 'FIX_AGENT=%s\n' "$tmp/fixagent" >> .dangle/config
+plan 010-race.md a.txt 'Agent: race'
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "FIX_AGENT from the config resolves a merge conflict" '[ "$(cat README)" = resolved ] && [ "$(cat "$tmp/fix-used" 2>/dev/null)" = used ] && grep -q "1 landed" "$tmp/out"'
+
+repo fixagent-cli
+rm -f "$tmp/fix-used"
+plan 010-race.md a.txt 'Agent: race'
+commit
+"$DANGLE" -y --fix-agent "$tmp/fixagent" > "$tmp/out" 2>&1
+check "--fix-agent on a run resolves a merge conflict" '[ "$(cat README)" = resolved ] && [ "$(cat "$tmp/fix-used" 2>/dev/null)" = used ] && grep -q "1 landed" "$tmp/out"'
+
+repo fixagent-land
+"$DANGLE" new side > "$tmp/out" 2>&1
+( cd .worktrees/side && echo side > side.txt && touch BAD && git add -A && git commit -qm "break the gate" )
+rm -f "$tmp/fix-used"
+"$DANGLE" land side --fix-agent "$tmp/fixagent" > "$tmp/out" 2>&1; export rc=$?
+check "dangle land --fix-agent fixes a failed gate with the fix agent" '[ $rc = 0 ] && [ -f side.txt ] && [ -f "$tmp/fix-used" ] && grep -q "fix-up 1" "$tmp/out" && ! git cat-file -e main:BAD 2>/dev/null'
+
 repo order
 plan 010-a.md a.txt
 plan 020-b.md b.txt

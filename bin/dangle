@@ -1621,7 +1621,7 @@ dangle: a carrot on a stick for your coding agent.
   dangle skill [--print]        install the plan-writing skill for your agents
 
   dangle new <branch> [--base B]   a worktree with .dangle/copy and the setup hook
-  dangle land [branch|id] [--fix] [--keep] [--now] [--no-gate]
+  dangle land [branch|id] [--fix] [--fix-agent SPEC] [--keep] [--now] [--no-gate]
                                 gate, squash and land a worktree; with QUEUE=batch it joins the
                                 merge queue (--now: gate it alone, outside the queue)
   dangle queue                  the branches waiting in the merge queue, and who drives it
@@ -1635,7 +1635,7 @@ dangle: a carrot on a stick for your coding agent.
 Run options:
   -a, --agent SPEC      agent for this run: claude:haiku, codex, opencode, pi:<model>,
                         an ALIAS_ from .dangle/config, or a bare model for the default
-      --fix-agent SPEC  agent for fix-ups after a failed gate (default: the agent)
+      --fix-agent SPEC  agent for fix-ups after a failed gate or merge conflict (default: the agent)
       --rest            after the ids given, run every other active plan too
       --fresh           start a plan's worktree over instead of continuing a kept one
       --follow          show the agent's output as it runs
@@ -2009,7 +2009,7 @@ cmd_lint() {
 }
 
 cmd_doctor() {
-  local probe=0 bad=0 w out
+  local probe=0 bad=0 w out fixspec
   [ "${1-}" = --agent ] && probe=1
   ok() { printf '  ok    %s\n' "$*"; }
   no() { printf '  FAIL  %s\n' "$*"; bad=1; }
@@ -2029,8 +2029,9 @@ cmd_doctor() {
   else
     no "no AGENT= in .dangle/config"
   fi
-  if [ -n "$(cfg FIX_AGENT)" ]; then
-    resolve_agent "$(cfg FIX_AGENT)" "$(cfg AGENT)"
+  fixspec=${DANGLE_FIX_AGENT:-$(cfg FIX_AGENT)}
+  if [ -n "$fixspec" ]; then
+    resolve_agent "$fixspec" "$(cfg AGENT)"
     command -v "${AGENT_CMD%% *}" >/dev/null 2>&1 && ok "fix agent $AGENT_LABEL" || no "fix agent command '${AGENT_CMD%% *}' not found"
   fi
   if [ -z "$REMOTE" ]; then
@@ -2172,8 +2173,8 @@ DONE=done
 # the prompt last.
 # Unset, each person's own default applies (~/.config/dangle/config, else claude). Found here:
 # AGENT=$agent
-# FIX_AGENT=claude:sonnet
-# Fix-up runs after a failed gate (0 = none).
+# FIX_AGENT=claude:sonnet  (fix-ups; default: AGENT)
+# Fix-up runs after a failed gate or merge conflict (0 = none).
 FIXES=1
 AGENT_TIMEOUT=4h
 # An agent with no new commit for this long is stopped (0 = never).
@@ -2364,11 +2365,14 @@ cmd_add() {
 }
 
 cmd_land() {
-  local name='' fix='' keep='' branch plan='' f spec
+  local name='' fix='' fixagent='' keep='' branch plan='' f spec
   [ -z "${DANGLE:-}" ] || die "refused: an agent run by dangle never lands; dangle lands this branch after you finish"
   while [ $# -gt 0 ]; do
     case $1 in
-      --fix) fix=1 ;; --keep) keep=1 ;; --now) NOW=1 ;; --no-gate) NOGATE=1 ;;
+      --fix) fix=1 ;;
+      --fix-agent) fix=1; fixagent=${2-}; shift ;;
+      --fix-agent=*) fix=1; fixagent=${1#*=} ;;
+      --keep) keep=1 ;; --now) NOW=1 ;; --no-gate) NOGATE=1 ;;
       -*) die "unknown option $1" ;; *) name=$1 ;;
     esac
     shift
@@ -2379,7 +2383,7 @@ cmd_land() {
   esac
   require_clean_base
   if [ -n "$fix" ]; then
-    spec=$(cfg FIX_AGENT "$(cfg AGENT)")
+    spec=${fixagent:-${DANGLE_FIX_AGENT:-$(cfg FIX_AGENT "$(cfg AGENT)")}}
     [ -n "$spec" ] || die "--fix needs an AGENT in .dangle/config"
     DANGLE_T_plan=${plan:+$PLANS/${plan##*/}} DANGLE_T_branch=$branch DANGLE_T_gate=$(gate_desc)
     export DANGLE_T_plan DANGLE_T_branch DANGLE_T_gate
