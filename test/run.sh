@@ -332,6 +332,24 @@ commit
 "$DANGLE" -y > "$tmp/out" 2>&1
 check "an agent merge that leaves conflict markers fails and is undone" '[ ! -f a.txt ] && grep -q "conflicts with main" "$tmp/out" && [ "$(cat .worktrees/plan-010/README)" = plan-edit ] && ! git -C .worktrees/plan-010 rev-parse -q --verify MERGE_HEAD >/dev/null'
 
+# A fix agent that cannot start (a bad flag): the failure says so, not just "conflicts".
+printf '#!/bin/sh\necho "Error: Unknown option: --bogus"\nexit 1\n' > "$tmp/badfix"
+chmod +x "$tmp/badfix"
+
+repo badfixmerge
+printf 'FIX_AGENT=%s\n' "$tmp/badfix" >> .dangle/config
+plan 010-race.md a.txt 'Agent: race'
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "a fix agent that fails on a conflict reports its own error" 'grep -q "conflicts with main (the agent exited 1 and left them: Error: Unknown option: --bogus)" "$tmp/out"'
+
+repo badfixgate
+printf 'FIX_AGENT=%s\n' "$tmp/badfix" >> .dangle/config
+plan 010-broken.md a.txt 'Agent: broken'
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "a fix agent that fails and changes nothing stops the landing with its error" 'grep -q "the fix agent exited 1 and changed nothing: Error: Unknown option: --bogus" "$tmp/out" && [ "$(grep -c "fix-up" "$tmp/out")" = 1 ]'
+
 repo locked
 plan 010-readme.md README
 commit

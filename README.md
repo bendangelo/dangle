@@ -52,7 +52,7 @@ Or copy `bin/dangle` anywhere on your `PATH`.
 cd your-repo
 dangle init              # writes .dangle/ with a gate for your language; read it
 dangle skill             # teaches your agents how to write plans for dangle
-dangle doctor --agent    # checks the setup and that the agent answers
+dangle doctor --agent    # checks the setup and that the agent and fix agent answer
 dangle --dry-run         # what would run
 dangle                   # run it
 ```

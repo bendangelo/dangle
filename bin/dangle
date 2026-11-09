@@ -1038,6 +1038,24 @@ run_agent() {
   return $rc
 }
 
+# agent_said <log>: the last line the agent wrote in its latest session in the log, for a reason.
+agent_said() {
+  awk '/^=== .* ===$/ { last = "" } NF { if ($0 !~ /^=== /) last = $0 } END { print last }' "$1"
+}
+
+# fix_up <fix spec> <worktree> <log>: a fix-up after a failed gate. An agent that exits with an
+# error and changes nothing (a bad flag, a model that is down) fails the landing with its own
+# words, instead of the gate running again on the same work.
+fix_up() {
+  local before rc=0
+  before=$(git -C "$2" rev-parse HEAD)
+  run_agent "$1" "$2" "$3" "$(render "$(template fix-prompt.md "$DEFAULT_FIX_PROMPT")")" || rc=$?
+  commit_leftovers "$2"
+  if [ $rc != 0 ] && [ "$(git -C "$2" rev-parse HEAD)" = "$before" ]; then
+    fail "the fix agent exited $rc and changed nothing: $(agent_said "$3")"; return 1
+  fi
+}
+
 # commit_leftovers <worktree>: an agent that forgot to commit still gets its work gated.
 commit_leftovers() {
   [ -n "$(git -C "$1" status --porcelain)" ] || return 0
@@ -1128,12 +1146,15 @@ FILES
 # merge_by_agent <worktree> <agent spec> <log> <commit before the merge>: the agent resolves the
 # merge in progress. It counts only when the merge is committed with no conflict marker left.
 merge_by_agent() {
-  local dir="$1" before="$4"
+  local dir="$1" before="$4" rc=0
   DANGLE_T_conflicts=$(git -C "$dir" diff --name-only --diff-filter=U | sed 's/^/- /')
   DANGLE_T_base=$BASE; export DANGLE_T_conflicts DANGLE_T_base
   say "  merge  conflicts with $BASE; the agent resolves them"
-  run_agent "$2" "$dir" "$3" "$(render "$(template merge-prompt.md "$DEFAULT_MERGE_PROMPT")")"
-  [ -z "$(git -C "$dir" diff --name-only --diff-filter=U)" ] || return 1
+  run_agent "$2" "$dir" "$3" "$(render "$(template merge-prompt.md "$DEFAULT_MERGE_PROMPT")")" || rc=$?
+  if [ -n "$(git -C "$dir" diff --name-only --diff-filter=U)" ]; then
+    [ $rc = 0 ] || MERGE_WHY="the agent exited $rc and left them: $(agent_said "$3")"
+    return 1
+  fi
   if git -C "$dir" rev-parse -q --verify MERGE_HEAD >/dev/null; then
     git -C "$dir" add -A && git -C "$dir" commit -q --no-edit || return 1
   fi
@@ -1145,11 +1166,13 @@ merge_by_agent() {
 # merge_base_in <worktree> <interactive> [agent spec] [log]: merges the base branch into the
 # worktree's branch. A conflict where both sides added lines is settled by itself; any other one
 # goes to the agent, when one is given, or stops (by hand: with the merge left for you).
-# MERGED_BY says who settled it: empty (a clean merge), auto or agent.
+# MERGED_BY says who settled it: empty (a clean merge), auto or agent. MERGE_WHY says why the
+# agent did not, when it failed rather than gave up.
 MERGED_BY=
+MERGE_WHY=
 merge_base_in() {
   local dir="$1" before
-  MERGED_BY=
+  MERGED_BY= MERGE_WHY=
   before=$(git -C "$dir" rev-parse HEAD)
   git -C "$dir" merge -q --no-edit "refs/heads/$BASE" >/dev/null 2>&1 && return 0
   if settle_added "$dir"; then MERGED_BY=auto; return 0; fi
@@ -1168,7 +1191,8 @@ merge_base_in() {
 merge_spending_fixes() {
   local spare=''
   [ "$fixes" -lt "$FIXES" ] && spare=$fix
-  merge_base_in "$path" "$inter" "$spare" "$alog" || { fail "conflicts with $BASE"; return 1; }
+  merge_base_in "$path" "$inter" "$spare" "$alog" ||
+    { fail "conflicts with $BASE${MERGE_WHY:+ ($MERGE_WHY)}"; return 1; }
   [ "$MERGED_BY" != agent ] || fixes=$((fixes + 1))
 }
 
@@ -1442,8 +1466,7 @@ queue_land() {
         say "  gate   failed; fix-up $fixes of $FIXES"
         DANGLE_T_gate_log=$log DANGLE_T_gate_tail=$(tail -n 80 "$log")
         export DANGLE_T_gate_log DANGLE_T_gate_tail
-        run_agent "$fix" "$path" "$alog" "$(render "$(template fix-prompt.md "$DEFAULT_FIX_PROMPT")")"
-        commit_leftovers "$path"
+        fix_up "$fix" "$path" "$alog" || return 1
         synced
         merge_spending_fixes || return 1 ;;
     esac
@@ -1512,8 +1535,7 @@ land() {
     say "  gate   failed; fix-up $fixes of $FIXES"
     DANGLE_T_gate_log=$log DANGLE_T_gate_tail=$(tail -n 80 "$log")
     export DANGLE_T_gate_log DANGLE_T_gate_tail
-    run_agent "$fix" "$path" "$alog" "$(render "$(template fix-prompt.md "$DEFAULT_FIX_PROMPT")")"
-    commit_leftovers "$path"
+    fix_up "$fix" "$path" "$alog" || return 1
     synced
     merge_spending_fixes || return 1
   done
@@ -2045,11 +2067,15 @@ cmd_doctor() {
   fi
   [ -n "$TIMEOUT_BIN" ] && ok "time limits ($TIMEOUT_BIN)" || warn "no timeout command (coreutils); a hung agent's own children may outlive its time limit"
   command -v systemd-inhibit >/dev/null 2>&1 || command -v caffeinate >/dev/null 2>&1 || warn "nothing to keep the computer awake (systemd-inhibit or caffeinate)"
-  if [ $probe = 1 ] && [ -n "$(cfg AGENT)" ]; then
-    resolve_agent "$(cfg AGENT)" ""
-    say "  ...   asking $AGENT_LABEL to reply (up to 3 minutes)"
-    out=$(cd "$PRIMARY" && set -f && set -- $AGENT_CMD && set +f && DANGLE=1 run_limited 180 "$@" "Reply with the single word OK and do nothing else." < /dev/null 2>&1)
-    case $out in *OK*) ok "the agent replied" ;; *) no "the agent did not reply OK:"; printf '%s\n' "$out" | tail -n 15 | sed 's/^/        /' ;; esac
+  if [ $probe = 1 ]; then
+    # The fix agent too: it runs only after a gate fails or a merge conflicts, hours into a run.
+    for w in AGENT FIX_AGENT; do
+      [ -n "$(cfg $w)" ] || continue
+      resolve_agent "$(cfg $w)" "$(cfg AGENT)"
+      say "  ...   asking $AGENT_LABEL ($w) to reply (up to 3 minutes)"
+      out=$(cd "$PRIMARY" && set -f && set -- $AGENT_CMD && set +f && DANGLE=1 run_limited 180 "$@" "Reply with the single word OK and do nothing else." < /dev/null 2>&1)
+      case $out in *OK*) ok "$w replied" ;; *) no "$w did not reply OK:"; printf '%s\n' "$out" | tail -n 15 | sed 's/^/        /' ;; esac
+    done
   fi
   return $bad
 }
