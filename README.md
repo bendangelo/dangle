@@ -174,8 +174,28 @@ dangle 866             # or: just this one plan, beside the main run
 ```
 
 Claims live in `.git/dangle/`, so they are per clone: runners on two computers do not see each
-other's claims. Give each computer its own ids (`dangle 864 865` on one, `dangle 872 873` on
-the other).
+other's claims. Either give each computer its own ids (`dangle 864 865` on one, `dangle 872 873`
+on the other), or set `REMOTE_CLAIMS=1`: each claim is then also the ref
+`refs/dangle/claims/<id>` on the remote, a commit of its own naming the computer. Of two
+computers that claim one plan, git takes only the first push (the second is not a fast-forward),
+and the other runner passes the plan over (`dangle status` says `running` and `on <computer>`).
+The ref goes when the plan lands or fails. A claim older than `CLAIM_TTL` (12h), or one this
+computer left behind when its run died, is stale and taken over. An unreachable remote never
+stops a plan: the local claim still holds.
+
+### Landing in the background: `PIPELINE`
+
+A plan spends a good part of its time after the agent: the gate, a fix-up, a wait in the merge
+queue. With `PIPELINE=1`, the runner hands that to a landing in the background and starts the
+next plan straight away; `PIPELINE=2` lets two land at once before the runner waits for one.
+The landing's output is in `.git/dangle/logs/<id>.land.log`, and its result joins the run's
+summary when it finishes. The run ends once every landing has.
+
+A plan that waits only for one plan landing here does not wait for it to land: it starts on that
+plan's branch (`worktree  on plan-865: 865 is landing`), and lands after it, as its own commit.
+If that plan fails, the one built on it does not land either; its worktree is kept (land the
+first, then run it again, or `--fresh` to start it over). A plan waiting for two or more is
+still held until they land.
 
 The night stops early when the agent fails fast twice in a row (out of credit, signed out,
 the model is down) instead of failing every plan in minutes. The computer is kept awake
@@ -369,11 +389,14 @@ PRUNE_DAYS=3         # prune worktrees idle for this long at the start and end o
 PRUNE_MAX_GB=0       # also prune worktrees larger than this; 0 = no size cap
 QUEUE=batch          # landings share one gate (the merge queue); default: off
 QUEUE_BRANCH=dangle-queue
+PIPELINE=1           # land in the background while the next plan starts; 0 = one at a time
+REMOTE_CLAIMS=1      # claims are refs on REMOTE too: runners on other computers see them
+CLAIM_TTL=12h        # a remote claim older than this is stale and may be taken over
 ALIAS_cheap=claude:haiku
 ```
 
-`DANGLE_AGENT`, `DANGLE_FIX_AGENT`, `DANGLE_REMOTE` and `DANGLE_QUEUE` in the environment
-override them.
+`DANGLE_AGENT`, `DANGLE_FIX_AGENT`, `DANGLE_REMOTE`, `DANGLE_QUEUE`, `DANGLE_PIPELINE` and
+`DANGLE_REMOTE_CLAIMS` in the environment override them.
 
 `dangle doctor` checks that `REMOTE/$BASE` is reachable for a fetch. When a fetch fails anyway —
 an empty or dead SSH agent, an offline laptop — dangle says why, once, and goes on with the

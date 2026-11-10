@@ -712,6 +712,96 @@ commit
 "$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
 check "queue: a run lands its plans through the queue" '[ $rc = 0 ] && [ -f a.txt ] && [ -f b.txt ] && [ -f plans/done/020-b.md ] && grep -q "queue  submitted" "$tmp/out" && git log -1 --format=%s | grep -q "^Plan 020-b.md$"'
 
+# ---------------------------------------------------------------- PIPELINE
+# A plan whose agent has finished lands in the background while the runner starts the next; a
+# plan that waits only for a plan landing here starts on its branch and lands after it.
+slow_gate='#!/bin/sh
+sleep 4
+[ ! -e BAD ] || { echo "BAD file present"; exit 1; }'
+export DANGLE_POLL=1
+
+repo pipeline
+printf 'PIPELINE=1\n' >> .dangle/config
+printf '%s\n' "$slow_gate" > .dangle/hooks/gate
+plan 010-a.md a.txt
+plan 020-b.md b.txt
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
+check "pipeline: both plans land" '[ $rc = 0 ] && [ -f a.txt ] && [ -f b.txt ] && grep -q "2 landed" "$tmp/out"'
+check "pipeline: the first lands in the background while the next starts" \
+  'grep -q "land   in the background" "$tmp/out" && [ -f .git/dangle/logs/010.land.log ] &&
+   [ "$(grep -n "  020  Plan" "$tmp/out" | head -n 1 | cut -d: -f1)" -lt "$(grep -n "  010  Plan" "$tmp/out" | sed -n 2p | cut -d: -f1)" ]'
+check "pipeline: nothing is left in the background" '[ -z "$(ls .git/dangle/bg)" ] && [ -z "$(ls .git/dangle/ready 2>/dev/null)" ]'
+
+repo stacked
+printf 'PIPELINE=1\n' >> .dangle/config
+printf '%s\n' "$slow_gate" > .dangle/hooks/gate
+plan 010-a.md a.txt
+plan 020-b.md b.txt '<!-- dangle: depends=010 -->'
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
+check "stacked: a dependent starts on the branch of the plan landing" 'grep -q "worktree  on plan-010: 010 is landing" "$tmp/out"'
+check "stacked: it lands after it, each as its own commit" \
+  '[ $rc = 0 ] && [ -f a.txt ] && [ -f b.txt ] && git log -1 --format=%s | grep -q "^Plan 020-b.md$" &&
+   git log -2 --format=%s | tail -n 1 | grep -q "^Plan 010-a.md$"'
+check "stacked: the parent mark is cleared" '[ -z "$(git config --get-regexp "branch\..*\.dangleparent")" ]'
+
+repo stacked-fail
+printf 'PIPELINE=1\nFIXES=0\n' >> .dangle/config
+printf '%s\n' "$slow_gate" > .dangle/hooks/gate
+plan 010-a.md a.txt 'Agent: broken'
+plan 020-b.md b.txt '<!-- dangle: depends=010 -->'
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
+check "stacked: when the parent fails, the plan built on it does not land" \
+  '[ $rc = 1 ] && [ ! -f a.txt ] && [ ! -f b.txt ] && grep -q "010 did not land" .git/dangle/results/020 && [ -d .worktrees/plan-020 ]'
+
+repo pipeline-queue
+printf 'PIPELINE=2\nQUEUE=batch\n' >> .dangle/config
+printf '%s\n' "$slow_gate" > .dangle/hooks/gate
+plan 010-a.md a.txt
+plan 020-b.md b.txt '<!-- dangle: depends=010 -->'
+plan 030-c.md c.txt
+commit
+DANGLE_QUEUE_POLL=1 "$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
+check "pipeline: landings in the background go through the merge queue" \
+  '[ $rc = 0 ] && [ -f a.txt ] && [ -f b.txt ] && [ -f c.txt ] && grep -q "3 landed" "$tmp/out" &&
+   grep -q "queue  submitted" .git/dangle/logs/010.land.log && [ "$(git rev-parse main)" = "$(git rev-parse origin/main)" ]'
+unset DANGLE_POLL
+
+# ---------------------------------------------------------------- REMOTE_CLAIMS
+# Claims as refs on the remote: a plan another computer runs is left to it.
+remote_claim_on() { # <id> [committer date]: a claim pushed by the computer "elsewhere"
+  e=$(git hash-object -t tree -w /dev/null)
+  c=$(printf 'dangle claim %s\n\nhost elsewhere\npid 1\n' "$1" | GIT_COMMITTER_DATE="${2:-$(date -R)}" git commit-tree "$e")
+  git push -q origin "$c:refs/dangle/claims/$1"
+}
+
+repo remote-claims
+printf 'REMOTE_CLAIMS=1\n' >> .dangle/config
+plan 010-a.md a.txt
+plan 020-b.md b.txt
+commit
+remote_claim_on 010
+"$DANGLE" status > "$tmp/out" 2>&1
+check "claims: status shows a plan claimed on another computer" 'grep -q "^010 *running" "$tmp/out" && grep -q "on elsewhere" "$tmp/out"'
+( sleep 6; git push -q origin :refs/dangle/claims/010 ) &
+DANGLE_POLL=1 "$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
+wait
+check "claims: a plan claimed elsewhere waits; the free one runs first" \
+  'grep -q "another dangle is running it (010 on elsewhere)" "$tmp/out" &&
+   [ "$(git log --format=%s main | head -n 2 | tr "\n" ,)" = "Plan 010-a.md,Plan 020-b.md," ]'
+check "claims: it runs once released, and no claim is left on the remote" \
+  '[ $rc = 0 ] && [ -f a.txt ] && [ -z "$(git ls-remote origin "refs/dangle/claims/*")" ]'
+
+repo remote-claims-stale
+printf 'REMOTE_CLAIMS=1\n' >> .dangle/config
+plan 010-a.md a.txt
+commit
+remote_claim_on 010 "2020-01-01T00:00:00Z"
+"$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
+check "claims: a stale claim is taken over" '[ $rc = 0 ] && [ -f a.txt ] && grep -q "took over a stale claim on 010" "$tmp/out"'
+
 # ---------------------------------------------------------------- disk
 # A kept worktree is build output nobody is using: dangle prunes it (with the project's
 # prune hook) when it has been idle long enough, is too big, or `dangle prune --rm` finds it
