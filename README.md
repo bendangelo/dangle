@@ -294,8 +294,20 @@ Hooks run with `DANGLE_PRIMARY` (the main checkout), `DANGLE_WORKTREE`, `DANGLE_
 ### Disk: worktrees are build output too
 
 Every worktree builds into its own directory, so agents never share a lock. The cost is disk:
-a `target/`, `node_modules/` or `.venv/` per worktree, and nothing ever collects them. dangle
-does not know which files are disposable, so the project says so in `hooks/prune`:
+a `target/`, `node_modules/` or `.venv/` per worktree. Two things collect it.
+
+**Finished plans are retired.** After a plan has finished (landed, submitted, failed or not
+run) and `PRUNE_AFTER_RUNS` plan cycles (default 2) have gone by without dangle using its
+worktree, dangle removes the worktree: before and after a run, and after each plan, so a long
+`--watch` session still cleans up. A branch with commits of its own stays, and `dangle <id>`
+recreates the worktree from it and continues the plan; an empty branch, one whose work is on
+the base branch, or a plan that has landed is deleted too. dangle never retires a worktree with
+changes, one in use, the merge queue, or the one you are standing in. A submitted plan's
+worktree goes as soon as the plan appears in the done folder on the base branch.
+`PRUNE_AFTER_RUNS=0` turns retirement off.
+
+**Build caches are pruned.** dangle does not know which files are disposable, so the project
+says so in `hooks/prune`:
 
 ```sh
 #!/bin/sh
@@ -311,11 +323,13 @@ dangle calls it, before and after every run, for each worktree that
 - was last used at least `PRUNE_DAYS` days ago (default 3), or is larger than `PRUNE_MAX_GB`
   GB (default 0: no size cap).
 
-It never touches a worktree whose plan another dangle is running, one a landing holds, the
+It also runs in detached worktrees (the merge queue, `dangle new` checkouts), but never removes
+them. It never touches a worktree whose plan another dangle is running, one a landing holds, the
 merge queue while it gates, or the worktree you are standing in. `dangle prune` does the same
 by hand (`-n` shows what it would do, `--all` ignores the age and size, `--days` and
-`--max-gb` override the config); `dangle prune --rm` also removes plan worktrees that have no
-commits of their own and no uncommitted files. `dangle list` shows each worktree's size.
+`--max-gb` override the config); `dangle prune --rm` also retires finished plan worktrees as
+the run would, and removes plan worktrees that have no commits of their own and no uncommitted
+files. `dangle list` shows each worktree's size.
 
 This is housekeeping, never a verdict: a failing prune hook is reported and the run goes on.
 The project decides the scope, and because only the worktree is pruned, a later run resumes
@@ -368,7 +382,7 @@ dangle land                    # gate, squash, land, remove (--keep keeps it, --
                                #   --fix-agent SPEC picks a stronger one for the fix-up)
 dangle queue                   # with QUEUE=batch: the branches waiting to be gated together
 dangle list                    # worktrees, ahead/behind, size, changes
-dangle prune                   # run hooks/prune in the idle worktrees; -n first, --rm to drop empty ones
+dangle prune                   # run hooks/prune in the idle worktrees; -n first, --rm also retires finished ones
 dangle rm my-fix               # teardown, then remove
 ```
 
@@ -395,7 +409,8 @@ WORKTREES=.worktrees
 BRANCH_PREFIX=plan-
 MAX_LINES=300
 HEARTBEAT=5m         # a progress line while an agent or the gate runs; 0 = off
-PRUNE_DAYS=3         # prune worktrees idle for this long at the start and end of a run; 0 = off
+PRUNE_AFTER_RUNS=2   # retire a finished plan's worktree after this many plan cycles; 0 = off
+PRUNE_DAYS=3         # prune build caches in worktrees idle for this long; 0 = off
 PRUNE_MAX_GB=0       # also prune worktrees larger than this; 0 = no size cap
 QUEUE=batch          # landings share one gate (the merge queue); default: off
 QUEUE_BRANCH=dangle-queue

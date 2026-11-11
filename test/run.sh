@@ -858,7 +858,7 @@ check "claims: a stale claim is taken over" '[ $rc = 0 ] && [ -f a.txt ] && grep
 # prune hook) when it has been idle long enough, is too big, or `dangle prune --rm` finds it
 # with no work of its own. It never touches a worktree in use or with changes.
 repo prune
-printf 'PRUNE_DAYS=1\n' >> .dangle/config
+printf 'PRUNE_DAYS=1\nPRUNE_AFTER_RUNS=0\n' >> .dangle/config
 cat > .dangle/hooks/prune <<'EOF'
 #!/bin/sh
 printf '%s %s %s\n' "$DANGLE_BRANCH" "$DANGLE_PRUNE_DAYS" "$DANGLE_PRUNE_REASON" >> "$DANGLE_PRIMARY/pruned"
@@ -896,12 +896,87 @@ check "a run prunes idle worktrees before it starts" \
 check "prune --rm removes a plan worktree with no commits of its own" \
   '[ ! -d .worktrees/plan-010 ] && grep -q "removed  plan-010" "$tmp/out"'
 
+git worktree add -q --detach .worktrees/side main
+mkdir -p .worktrees/side/junk && echo x > .worktrees/side/junk/x
+"$DANGLE" prune --all > "$tmp/out" 2>&1
+check "prune runs the hook in a detached worktree and keeps it" \
+  '[ ! -d .worktrees/side/junk ] && [ -d .worktrees/side ]'
+
 repo prune-nohook
 plan 010-stuck.md a.txt 'Agent: idle'
 commit
 "$DANGLE" -y 010 > "$tmp/out" 2>&1
 "$DANGLE" prune > "$tmp/out" 2>&1
 check "prune without a hook says where the policy lives" 'grep -q "no .dangle/hooks/prune" "$tmp/out"'
+
+# A finished plan's worktree is build output too. After PRUNE_AFTER_RUNS plan cycles without
+# use, dangle removes the worktree and keeps a branch that has commits of its own, so
+# `dangle <id>` can still continue it. It needs no prune hook: fetching a recovery copy is not
+# the project's policy.
+repo retire
+printf 'PRUNE_AFTER_RUNS=2\nFIXES=0\n' >> .dangle/config
+plan 010-stuck.md a.txt 'Agent: broken'
+plan 020-next.md b.txt
+plan 030-last.md c.txt
+commit
+"$DANGLE" -y 010 > "$tmp/out" 2>&1
+check "retire: a failed plan keeps its worktree" \
+  '[ -d .worktrees/plan-010 ] && git show-ref -q --verify refs/heads/plan-010'
+"$DANGLE" -y 020 > "$tmp/out" 2>&1
+check "retire: one plan cycle later it is still kept" '[ -d .worktrees/plan-010 ]'
+"$DANGLE" -y 030 > "$tmp/out" 2>&1
+check "retire: two plan cycles later the worktree goes and the branch stays" \
+  '[ ! -d .worktrees/plan-010 ] && git show-ref -q --verify refs/heads/plan-010 && grep -q "retired  plan-010" "$tmp/out"'
+"$DANGLE" status > "$tmp/out" 2>&1
+check "retire: status shows the plan failed with its branch kept, not ready" \
+  'grep -q "^010 *failed" "$tmp/out"'
+"$DANGLE" -y 010 > "$tmp/out" 2>&1 || true
+check "retire: dangle <id> recreates the worktree from the kept branch" '[ -d .worktrees/plan-010 ]'
+
+repo retire-untracked
+printf 'PRUNE_AFTER_RUNS=1\n' >> .dangle/config
+plan 010-stuck.md a.txt 'Agent: idle'
+plan 020-next.md b.txt
+commit
+"$DANGLE" -y 010 > "$tmp/out" 2>&1
+echo keep > .worktrees/plan-010/untracked.txt
+"$DANGLE" -y 020 > "$tmp/out" 2>&1
+check "retire: a worktree with untracked files is kept, with the reason" \
+  '[ -d .worktrees/plan-010 ] && grep -q "keep     plan-010 .*untracked" "$tmp/out"'
+
+repo retire-off
+printf 'PRUNE_AFTER_RUNS=0\n' >> .dangle/config
+plan 010-stuck.md a.txt 'Agent: idle'
+plan 020-next.md b.txt
+plan 030-last.md c.txt
+commit
+"$DANGLE" -y 010 > "$tmp/out" 2>&1
+"$DANGLE" -y 020 > "$tmp/out" 2>&1
+"$DANGLE" -y 030 > "$tmp/out" 2>&1
+check "retire: PRUNE_AFTER_RUNS=0 turns it off" '[ -d .worktrees/plan-010 ]'
+
+repo retire-submitted
+plan 010-a.md a.txt
+plan 020-b.md b.txt
+commit
+printf '#!/bin/sh\ngit push -q "$DANGLE_REMOTE" "HEAD:refs/heads/pr-$DANGLE_BRANCH"\n' > .dangle/hooks/land
+chmod +x .dangle/hooks/land
+commit "pr hook"
+"$DANGLE" -y > "$tmp/out" 2>&1
+mkdir -p plans/done
+git mv plans/010-a.md plans/done/010-a.md
+commit "land 010"
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "retire: a submitted plan that landed is cleared and its worktree retired" \
+  '[ ! -f .git/dangle/submitted/010 ] && [ ! -d .worktrees/plan-010 ] && [ -z "$(git branch --list plan-010)" ]'
+
+repo branch-gc
+plan 010-a.md a.txt
+commit
+git branch plan-099 main
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "retire: a plan branch with no worktree and no work of its own is removed" \
+  '[ -z "$(git branch --list plan-099)" ] && grep -q "removed  plan-099" "$tmp/out"'
 
 repo add-ids
 plan 010-one.md one.txt

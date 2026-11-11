@@ -189,8 +189,14 @@ settings() {
   # .dangle/hooks/prune hook at the start and end of a run. 0 turns either rule off.
   PRUNE_DAYS=$(cfg PRUNE_DAYS 3)
   PRUNE_MAX_GB=$(cfg PRUNE_MAX_GB 0)
+  # A finished plan's worktree is retired after this many plan cycles without use (its branch
+  # stays when it has commits of its own). 0 turns retirement off.
+  PRUNE_AFTER_RUNS=$(cfg PRUNE_AFTER_RUNS 2)
   case $PRUNE_DAYS in ''|*[!0-9]*) PRUNE_DAYS=3 ;; esac
   case $PRUNE_MAX_GB in ''|*[!0-9]*) PRUNE_MAX_GB=0 ;; esac
+  case $PRUNE_AFTER_RUNS in ''|*[!0-9]*) PRUNE_AFTER_RUNS=2 ;; esac
+  PLAN_COUNT=$(cat "$STATE/plans" 2>/dev/null || true)
+  case $PLAN_COUNT in ''|*[!0-9]*) PLAN_COUNT=0 ;; esac
   # QUEUE=batch: a landing joins the merge queue instead of running its own gate (queue_land).
   QUEUE=${DANGLE_QUEUE:-$(cfg QUEUE off)}
   QUEUE_BRANCH=$(cfg QUEUE_BRANCH dangle-queue)
@@ -746,9 +752,10 @@ new_worktree() {
   hook setup "$path" || { err "the setup hook failed in $path"; return 1; }
 }
 
-# remove_worktree <branch> [force]: runs the teardown hook, removes the worktree and branch.
+# remove_worktree <branch> [force] [keep-branch]: runs the teardown hook, removes the worktree
+# and branch (unless keep-branch).
 remove_worktree() {
-  local branch="$1" force="${2-}" path here=0
+  local branch="$1" force="${2-}" keepbranch="${3-}" path here=0
   path=$(wt_path "$branch")
   caller_inside "$path" && here=1
   # The caller may be standing in the worktree that is about to go.
@@ -763,7 +770,7 @@ remove_worktree() {
     fi
   fi
   git worktree prune
-  if git show-ref -q --verify "refs/heads/$branch"; then
+  if [ -z "$keepbranch" ] && git show-ref -q --verify "refs/heads/$branch"; then
     if [ -n "$force" ]; then git branch -q -D "$branch"; else git branch -q -d "$branch"; fi
   fi
 }
@@ -784,14 +791,21 @@ human_kb() {
 # file_epoch <file>: its mtime in seconds (GNU and BSD stat).
 file_epoch() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
 
-# wt_idle_days <branch>: whole days since dangle last finished a plan in the worktree (its
-# result file), or since the branch tip was committed for a worktree dangle has no result
-# for (the merge queue's, or one made with `dangle new`).
+# wt_idle_days <branch> [path]: whole days since dangle last finished a plan in the worktree
+# (its result file), or since the branch tip was committed for a worktree dangle has no result
+# for (the merge queue's, or one made with `dangle new`). A detached worktree has no branch:
+# use its HEAD's commit time.
 wt_idle_days() {
-  local branch="$1" id='' since=0 now
+  local branch="$1" path="${2-}" id='' since=0 now
   case $branch in "$PREFIX"*) id=${branch#"$PREFIX"} ;; esac
   if [ -n "$id" ] && [ -f "$STATE/results/$id" ]; then since=$(file_epoch "$STATE/results/$id"); fi
-  [ "$since" != 0 ] || since=$(git log -1 --format=%ct "refs/heads/$branch" 2>/dev/null || echo 0)
+  if [ "$since" = 0 ]; then
+    if [ -n "$branch" ]; then
+      since=$(git log -1 --format=%ct "refs/heads/$branch" 2>/dev/null || echo 0)
+    else
+      since=$(git -C "$path" log -1 --format=%ct 2>/dev/null || echo 0)
+    fi
+  fi
   case $since in ''|*[!0-9]*) since=0 ;; esac
   now=$(date +%s)
   [ "$since" != 0 ] || since=$now
@@ -805,39 +819,58 @@ lock_pid() {
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && printf '%s' "$pid"
 }
 
-# wt_busy <branch>: 0 when a live dangle is working in the worktree (a plan claim, the merge
-# queue, a landing), when it has uncommitted changes, or when it is the one we stand in.
+# wt_busy <path> [branch]: 0 when a live dangle is working in the worktree (a plan claim, the
+# merge queue, a landing), when it has uncommitted changes, or when it is the one we stand in.
 # Pruning never touches a worktree someone is using.
 wt_busy() {
-  local branch="$1" id path
-  path=$(wt_path "$branch")
+  local path="$1" branch="${2-}" id
   case "$(pwd -P)/" in "$path"/*) return 0 ;; esac
   case $branch in
     "$PREFIX"*) id=${branch#"$PREFIX"}
       [ -z "$(lock_pid "$STATE/claims/$id")" ] || return 0 ;;
   esac
-  [ "$branch" != "$QUEUE_BRANCH" ] || [ -z "$(lock_pid "$STATE/queue.lock")" ] || return 0
+  if [ -n "$branch" ] && [ "$branch" = "$QUEUE_BRANCH" ] && [ -n "$(lock_pid "$STATE/queue.lock")" ]; then return 0; fi
   [ -z "$(lock_pid "$STATE/land.lock")" ] || return 0
   [ -z "$(git -C "$path" status --porcelain --untracked-files=no 2>/dev/null)" ] || return 0
   return 1
 }
 
-# wt_branches: the branches of the worktrees under WORKTREES, one per line.
-wt_branches() {
+# wt_entries: `path<TAB>branch` for every worktree under WORKTREES (branch empty when
+# detached), one per line.
+wt_entries() {
   git worktree list --porcelain | awk -v p="$PRIMARY/$WORKTREES/" '
-    /^worktree / { w = substr($0, 10) }
-    /^branch / { b = substr($0, 19); if (index(w, p) == 1) print b }'
+    /^worktree / { w = substr($0, 10); b = "" }
+    /^branch / { b = substr($0, 19) }
+    /^$/ { if (index(w, p) == 1) print w "\t" b; w = ""; b = "" }
+    END { if (w != "" && index(w, p) == 1) print w "\t" b }'
 }
 
-# prune_worktree <branch> <days> <reason>: the project's prune hook in the worktree. What is
-# disposable is the project's business (build output, caches); housekeeping never fails a run.
+# wt_label <path> [branch]: the name pruning output uses.
+wt_label() { if [ -n "${2-}" ]; then printf '%s' "$2"; else printf '@%s' "${1##*/}"; fi; }
+
+# plan_tick: one plan cycle finished. PRUNE_AFTER_RUNS counts these, not dangle invocations,
+# so a long --watch session still advances the retention clock.
+plan_tick() {
+  PLAN_COUNT=$((PLAN_COUNT + 1))
+  printf '%s\n' "$PLAN_COUNT" > "$STATE/plans"
+}
+
+# stamp_worktree <branch>: dangle last used the worktree at this plan cycle.
+stamp_worktree() {
+  local f="$STATE/seen/$1"
+  mkdir -p "$(dirname "$f")"
+  printf '%s\n' "$PLAN_COUNT" > "$f"
+}
+
+# prune_worktree <path> <branch> <days> <reason>: the project's prune hook in the worktree.
+# What is disposable is the project's business (build output, caches); housekeeping never
+# fails a run. A detached worktree has no branch.
 prune_worktree() {
-  local branch="$1" path
-  path=$(wt_path "$branch")
+  local path="$1" branch="$2"
   export_ctx "$path" "$branch"
-  DANGLE_PRUNE_DAYS="$2" DANGLE_PRUNE_REASON="$3"
+  DANGLE_PRUNE_DAYS="$3" DANGLE_PRUNE_REASON="$4"
   export DANGLE_PRUNE_DAYS DANGLE_PRUNE_REASON
-  hook prune "$path" "$2" || err "the prune hook failed in $path (going on)"
+  hook prune "$path" "$3" || err "the prune hook failed in $path (going on)"
   return 0
 }
 
@@ -847,63 +880,66 @@ prune_worktree() {
 # sizes and the space freed to the output (a du pass per worktree).
 prune_all() {
   local days="$1" maxg="$2" dry="$3" all="$4" rm="$5" measure="$6"
-  local branch path ahead kb after reason pruned=0 removed=0 freed=0 over
+  local branch path label ahead kb after reason pruned=0 removed=0 freed=0 over
   has_hook prune || [ "$rm" = 1 ] || return 0
   over=$((maxg * 1048576))
-  for branch in $(wt_branches); do
-    path=$(wt_path "$branch")
-    [ -d "$path" ] || continue
-    if wt_busy "$branch"; then
-      [ "$all" = 0 ] || say "  skip     $branch (in use, or it has changes)"
+  while IFS="$(printf '\t')" read -r path branch; do
+    [ -n "$path" ] && [ -d "$path" ] || continue
+    label=$(wt_label "$path" "$branch")
+    if wt_busy "$path" "$branch"; then
+      [ "$all" = 0 ] || say "  skip     $label (in use, or it has changes)"
       continue
     fi
-    ahead=$(git rev-list --count "refs/heads/$BASE..refs/heads/$branch" 2>/dev/null || echo 0)
+    ahead=0
+    [ -z "$branch" ] || ahead=$(git rev-list --count "refs/heads/$BASE..refs/heads/$branch" 2>/dev/null || echo 0)
     kb=0
     if [ "$measure" = 1 ] || [ "$maxg" != 0 ]; then kb=$(wt_kb "$path"); fi
     reason=''
     if [ "$all" = 1 ]; then reason=all
-    elif [ "$(wt_idle_days "$branch")" -ge "$days" ]; then reason=idle
+    elif [ "$(wt_idle_days "$branch" "$path")" -ge "$days" ]; then reason=idle
     elif [ "$maxg" != 0 ] && [ "$kb" -ge "$over" ]; then reason=size
     fi
     [ -n "$reason" ] || continue
     # Nothing committed and nothing in progress: --rm drops the whole worktree, not just its
     # build output. A worktree of your own (not a plan's) is never removed.
-    if [ "$rm" = 1 ] && [ "$ahead" = 0 ]; then
+    if [ "$rm" = 1 ] && [ -n "$branch" ] && [ "$ahead" = 0 ]; then
       case $branch in
         "$PREFIX"*)
           # Untracked files would go with it: leave a worktree that still holds any.
           if [ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]; then
-            [ "$all" = 0 ] || say "  skip     $branch (untracked files)"
+            [ "$all" = 0 ] || say "  skip     $label (untracked files)"
             continue
           fi
           if [ "$dry" = 1 ]; then
-            say "  would remove $branch (no commits of its own)"
+            say "  would remove $label (no commits of its own)"
           elif remove_worktree "$branch"; then
             removed=$((removed + 1))
             [ "$measure" = 0 ] || freed=$((freed + kb))
-            say "  removed  $branch"
+            say "  removed  $label"
           fi
           continue ;;
       esac
     fi
     if [ "$dry" = 1 ]; then
       if [ "$measure" = 0 ]; then
-        say "  would prune $branch ($reason)"
+        say "  would prune $label ($reason)"
       else
-        say "  would prune $branch ($reason, $(human_kb "$kb"))"
+        say "  would prune $label ($reason, $(human_kb "$kb"))"
       fi
       continue
     fi
     has_hook prune || continue
     if [ "$measure" = 1 ]; then
-      say "  pruning  $branch ($reason, $(human_kb "$kb"))"
+      say "  pruning  $label ($reason, $(human_kb "$kb"))"
     else
-      say "  pruning  $branch ($reason)"
+      say "  pruning  $label ($reason)"
     fi
-    prune_worktree "$branch" "$days" "$reason"
+    prune_worktree "$path" "$branch" "$days" "$reason"
     pruned=$((pruned + 1))
     if [ "$measure" = 1 ]; then after=$(wt_kb "$path"); freed=$((freed + kb - after)); fi
-  done
+  done <<EOF
+$(wt_entries)
+EOF
   if [ "$pruned" = 0 ] && [ "$removed" = 0 ]; then return 0; fi
   if [ "$measure" = 1 ]; then
     say "  pruned $pruned worktree(s), removed $removed, freed $(human_kb "$freed")"
@@ -912,12 +948,130 @@ prune_all() {
   fi
 }
 
-# prune_auto: housekeeping around a run: worktrees idle for PRUNE_DAYS days or over
-# PRUNE_MAX_GB are pruned; nothing is removed.
+# wt_runs_idle <branch> [dry]: plan cycles since dangle last used the worktree. A worktree
+# from before the stamps gets a fresh start, so upgrading never deletes anything at once.
+wt_runs_idle() {
+  local branch="$1" seen
+  seen=$(cat "$STATE/seen/$branch" 2>/dev/null || true)
+  case $seen in
+    ''|*[!0-9]*)
+      [ "${2-}" = 1 ] || stamp_worktree "$branch"
+      seen=$PLAN_COUNT ;;
+  esac
+  [ "$seen" -le "$PLAN_COUNT" ] || seen=$PLAN_COUNT
+  echo $((PLAN_COUNT - seen))
+}
+
+# retire_one <path> <branch> <dry> <measure>: remove a finished plan's worktree. A branch with
+# commits of its own stays (dangle <id> recreates the worktree); an empty or landed one goes.
+retire_one() {
+  local path="$1" branch="$2" dry="$3" measure="$4" id idle reason kb ahead keep
+  [ "$PRUNE_AFTER_RUNS" != 0 ] || return 1
+  case $branch in "$PREFIX"*) ;; *) return 1 ;; esac
+  id=${branch#"$PREFIX"}
+  [ -f "$STATE/results/$id" ] || return 1
+  idle=$(wt_runs_idle "$branch" "$dry")
+  reason=''
+  if [ "$PRUNE_AFTER_RUNS" != 0 ] && [ "$idle" -ge "$PRUNE_AFTER_RUNS" ]; then
+    reason="$idle plan cycle(s) idle"
+  elif [ "$measure" = 1 ] && [ "$PRUNE_MAX_GB" != 0 ] && [ "$idle" -ge 1 ]; then
+    kb=$(wt_kb "$path")
+    [ "$kb" -lt $((PRUNE_MAX_GB * 1048576)) ] || reason="over ${PRUNE_MAX_GB}G after $idle run(s)"
+  fi
+  [ -n "$reason" ] || return 1
+  if wt_busy "$path" "$branch" || dir_in_use "$path"; then
+    say "  keep     $branch ($reason: in use)"
+    return 0
+  fi
+  if [ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]; then
+    say "  keep     $branch ($reason: untracked files)"
+    return 0
+  fi
+  ahead=$(git rev-list --count "refs/heads/$BASE..refs/heads/$branch" 2>/dev/null || echo 0)
+  keep=1
+  if [ "$ahead" = 0 ] || on_base "$branch" || is_landed "$id"; then keep=; fi
+  if [ "$dry" = 1 ]; then
+    say "  would retire $branch ($reason$([ -n "$keep" ] && printf '; branch kept'))"
+    return 0
+  fi
+  if [ -n "$keep" ]; then
+    if remove_worktree "$branch" force keep; then
+      rm -f "$STATE/seen/$branch"
+      say "  retired  $branch ($reason; branch kept)"
+    else
+      say "  keep     $branch ($reason: not removed)"
+    fi
+  elif remove_worktree "$branch" force; then
+    rm -f "$STATE/seen/$branch"
+    say "  retired  $branch ($reason)"
+  else
+    say "  keep     $branch ($reason: not removed)"
+  fi
+  return 0
+}
+
+# retire_all <dry> <measure>: every finished plan worktree, then submitted markers whose plan
+# landed, then plan branches left behind without a worktree.
+retire_all() {
+  local dry="$1" measure="$2" path branch m id b ahead
+  while IFS="$(printf '\t')" read -r path branch; do
+    [ -n "$path" ] && [ -n "$branch" ] && [ -d "$path" ] || continue
+    retire_one "$path" "$branch" "$dry" "$measure" || true
+  done <<EOF
+$(wt_entries)
+EOF
+  if [ -d "$STATE/submitted" ]; then
+    for m in "$STATE/submitted"/*; do
+      [ -f "$m" ] || continue
+      id=${m##*/}
+      is_landed "$id" || continue
+      branch="$PREFIX$id"
+      if [ "$dry" = 1 ]; then
+        say "  would clear submitted $id (landed)"
+        continue
+      fi
+      if [ -d "$(wt_path "$branch")" ]; then
+        if wt_busy "$(wt_path "$branch")" "$branch" || dir_in_use "$(wt_path "$branch")" ||
+          [ -n "$(git -C "$(wt_path "$branch")" status --porcelain 2>/dev/null)" ]; then
+          say "  keep     $branch (landed; in use or has files)"
+          continue
+        fi
+        remove_worktree "$branch" force || { say "  keep     $branch (landed; not removed)"; continue; }
+        say "  retired  $branch (landed; submitted)"
+      elif git show-ref -q --verify "refs/heads/$branch"; then
+        git branch -q -D "$branch"
+      fi
+      rm -f "$m" "$STATE/seen/$branch"
+      say "  cleared  submitted $id (landed)"
+    done
+  fi
+  for b in $(git for-each-ref --format='%(refname:short)' "refs/heads/$PREFIX*"); do
+    git show-ref -q --verify "refs/heads/$b" || continue
+    if git worktree list --porcelain | awk -v b="refs/heads/$b" '$0 == "branch " b { f = 1 } END { exit !f }'; then
+      continue
+    fi
+    ahead=$(git rev-list --count "refs/heads/$BASE..refs/heads/$b" 2>/dev/null || echo 0)
+    id=${b#"$PREFIX"}
+    [ "$ahead" = 0 ] || on_base "$b" || is_landed "$id" || continue
+    if [ "$dry" = 1 ]; then
+      say "  would remove $b (no work of its own)"
+    elif git branch -q -D "$b"; then
+      rm -f "$STATE/seen/$b"
+      say "  removed  $b (no work of its own)"
+    fi
+  done
+}
+
+# prune_auto: housekeeping around a run: finished plan worktrees are retired, and worktrees
+# idle for PRUNE_DAYS days or over PRUNE_MAX_GB are pruned with the hook.
 prune_auto() {
+  local measure=0
+  # Measuring every worktree is a du pass per worktree: only when a size cap can use it.
+  [ "${PRUNE_MAX_GB:-0}" = 0 ] || measure=1
+  retire_all 0 "$measure"
   if [ "${PRUNE_DAYS:-0}" = 0 ] && [ "${PRUNE_MAX_GB:-0}" = 0 ]; then return 0; fi
   has_hook prune || return 0
-  prune_all "$PRUNE_DAYS" "$PRUNE_MAX_GB" 0 0 0 "$(if [ "$PRUNE_MAX_GB" != 0 ]; then echo 1; else echo 0; fi)"
+  prune_all "$PRUNE_DAYS" "$PRUNE_MAX_GB" 0 0 0 "$measure"
 }
 
 # on_base <branch>: the branch has work of its own, and all of it is on the base branch already:
@@ -1851,7 +2005,7 @@ dangle: a carrot on a stick for your coding agent.
   dangle rm <branch> [-f]       the teardown hook, then remove a worktree and its branch
   dangle prune [-n] [--days N] [--max-gb N] [--all] [--rm]
                                 run .dangle/hooks/prune in the worktrees idle for N days or
-                                over N GB; --rm also removes plan worktrees with no commits
+                                over N GB; --rm also retires finished plan worktrees
   dangle list                   worktrees with ahead/behind, size and changes
   dangle path <branch|id>       print a worktree's path:  cd "$(dangle path 865)"
 
@@ -1976,7 +2130,7 @@ bg_land() {
 # it landed itself (its locals: landed, failed, fast, summary, total). With `wait`, waits until
 # at least one has finished.
 reap() {
-  local d id f t0 t1 n result path pid got=0 FAIL_REASON title
+  local d id f t0 t1 n result path branch pid got=0 FAIL_REASON title
   while :; do
     for d in "$STATE"/bg/$$.*; do
       [ -d "$d" ] || continue
@@ -1988,6 +2142,7 @@ reap() {
       fi
       result=$(sed -n 1p "$d/result"); FAIL_REASON=$(sed -n 2p "$d/result")
       f=$(cat "$d/plan"); path=$(cat "$d/path"); title=$(cat "$d/title")
+      branch=$(basename "$path")
       read -r t0 t1 n < "$d/times"
       rm -rf "$d"
       got=1
@@ -2002,6 +2157,9 @@ reap() {
         if [ "${t1:-999}" -lt 60 ]; then fast=$((fast + 1)); fastwhy=$FAIL_REASON; else fast=0; fi
       fi
       unclaim "$id"
+      plan_tick
+      [ -d "$path" ] && stamp_worktree "$branch"
+      retire_all 0 0
       note_result "$result"
       record_duration "$(( $(date +%s) - t0 ))"
     done
@@ -2065,7 +2223,8 @@ $f"
     done
   fi
   queue=$(printf '%s\n' "$queue" | sed '/^$/d')
-  [ -n "$queue" ] || [ $watch = 1 ] || { say "dangle: no active plans in $PLANS"; return 0; }
+  # No plans left is exactly when finished worktrees pile up: housekeep before saying so.
+  [ -n "$queue" ] || [ $watch = 1 ] || { prune_auto; say "dangle: no active plans in $PLANS"; return 0; }
   total=$(printf '%s\n' "$queue" | sed '/^$/d' | wc -l | tr -d ' ')
   known=$queue
 
@@ -2111,8 +2270,8 @@ $f"
   [ $said_estimate = 1 ] || say "  $estimate"
   find "$STATE" -maxdepth 1 -name 'landed-*' -mtime +1 -exec rm -f {} + 2>/dev/null
   synced
-  # Space: worktrees left behind by earlier runs (kept plans, the merge queue) get pruned
-  # before another night of builds starts, and again at the end.
+  # Space: worktrees left behind by earlier runs (kept plans, the merge queue) get retired or
+  # pruned before another night of builds starts, and again at the end.
   prune_auto
   tstart=$(date +%s)
 
@@ -2307,6 +2466,10 @@ $f"
         if [ "${t1:-999}" -lt 60 ]; then fast=$((fast + 1)); fastwhy=$FAIL_REASON; else fast=0; fi
       fi
       unclaim "$id"
+      plan_tick
+      [ -d "$path" ] && stamp_worktree "$branch"
+      # The next plan may make an old, finished worktree due: retire it now, during the run.
+      retire_all 0 0
     fi
     note_result "$result"
     [ "$timed" = 1 ] && record_duration "$(( $(date +%s) - t0 ))"
@@ -2354,6 +2517,7 @@ cmd_status() {
     elif [ -n "$deps" ]; then state="waiting"
     elif on_base "$PREFIX$id"; then state="on-$BASE"
     elif [ -d "$(wt_path "$PREFIX$id")" ]; then state="kept"
+    elif [ -f "$STATE/results/$id" ] && grep -q ' FAILED' "$STATE/results/$id"; then state="failed"
     else state="ready"; fi
     printf '%-8s %-10s %s\n' "$id" "$state" "$(plan_title "$f")"
     [ -n "$host" ] && printf '%-19s on %s\n' '' "$host"
@@ -2405,7 +2569,8 @@ cmd_doctor() {
   [ "$PRIVATE" = 0 ] || ok "$PLANS is ignored by git: private plans (copied into worktrees, moved to $DONE/ on disk)"
   [ -f "$DOT/config" ] && ok ".dangle/config" || warn "no .dangle/config: run dangle init"
   if has_hook gate; then ok "gate hook"; else no "no executable .dangle/hooks/gate: nothing would check the work"; fi
-  for w in setup teardown regate land lint "done"; do
+  if has_hook prune; then ok "prune hook"; else warn "no .dangle/hooks/prune: build caches are never reclaimed (worktrees are still retired)"; fi
+  for w in setup teardown prune regate land lint "done"; do
     if [ -e "$HOOKS/$w" ] && [ ! -x "$HOOKS/$w" ]; then no ".dangle/hooks/$w is not executable (chmod +x)"; fi
   done
   if [ -n "$(cfg AGENT)" ]; then
@@ -2831,7 +2996,9 @@ cmd_prune() {
   done
   case $days in ''|*[!0-9]*) die "--days takes a number of days" ;; esac
   case $maxg in ''|*[!0-9]*) die "--max-gb takes a number of gigabytes" ;; esac
-  [ -n "$(wt_branches)" ] || { say "dangle: no worktrees"; return 0; }
+  [ -n "$(wt_entries)" ] || { say "dangle: no worktrees"; return 0; }
+  # --rm is the manual version of the run's housekeeping: retire finished plan worktrees too.
+  [ "$rm" = 0 ] || retire_all "$dry" 1
   if ! has_hook prune && [ "$rm" = 0 ]; then
     say "dangle: no .dangle/hooks/prune, so dangle does not know what is disposable here"
     say "        write one (see the README) or pass --rm to remove worktrees with no work"
