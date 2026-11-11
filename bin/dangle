@@ -1230,7 +1230,9 @@ not_run_reason() {
   if [ -z "$err" ]; then
     err=$(tail -c +$((AGENT_JSONL_OFF + 1)) "${log%.log}.jsonl" 2>/dev/null |
       grep -E '"finalError":"|"is_error":true' |
-      sed -n 's/.*"finalError":"\([^"\\]*\(\\.[^"\\]*\)*\)".*/\1/p; t; s/.*"is_error":true.*"result":"\([^"\\]*\(\\.[^"\\]*\)*\)".*/\1/p' |
+      sed -n -e 's/.*"finalError":"\([^"\\]*\(\\.[^"\\]*\)*\)".*/\1/p' \
+        -e 't' \
+        -e 's/.*"is_error":true.*"result":"\([^"\\]*\(\\.[^"\\]*\)*\)".*/\1/p' |
       sed 's/\\"/"/g' | tail -n 1)
   fi
   if [ -n "$err" ]; then
