@@ -415,8 +415,8 @@ local `BASE` rather than repeating the warning on every poll.
 ## Development
 
 ```sh
-test/run.sh                      # end-to-end tests with a fake agent
-shellcheck -s sh bin/dangle
+bin/check                        # shellcheck and the end-to-end tests
+test/run.sh                      # end-to-end tests with a fake agent, alone
 ```
 
 MIT license.

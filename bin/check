@@ -1,0 +1,8 @@
+#!/bin/sh
+# What must pass before a commit: shellcheck, the end-to-end tests, and the skill check.
+set -eu
+cd "$(dirname "$0")/.."
+
+shellcheck -s sh -S warning -e SC3043 bin/dangle bin/release install.sh examples/land/* examples/regate-docs-only
+test/run.sh
+bin/dangle skill --print | diff - skill/SKILL.md
