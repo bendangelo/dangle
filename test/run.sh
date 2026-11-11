@@ -217,6 +217,57 @@ plan 030-c.md c.txt
 commit
 "$DANGLE" -y > "$tmp/out" 2>&1
 check "two fast failures stop the night" 'grep -q "failed fast twice" "$tmp/out" && [ ! -f c.txt ]'
+check "the fast-failure stop names the last reason" 'grep -q "failed fast twice in a row; the last: the agent made no commits" "$tmp/out"'
+
+# A provider error (pi: `error: 429 …`, exit 0) is tried again after RETRY_WAIT, then NOT RUN:
+# the plan stays queued, its empty worktree goes, the night stops.
+printf '#!/bin/sh\necho "error: 429: The inference service is overloaded."\nexit 0\n' > "$tmp/agent-overloaded"
+chmod +x "$tmp/agent-overloaded"
+repo overloaded
+printf 'AGENT=%s\nRETRY_WAIT=1s 1s\n' "$tmp/agent-overloaded" >> .dangle/config
+plan 010-a.md a.txt
+plan 020-b.md b.txt
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1; rc=$?
+check "a provider error is tried again after each RETRY_WAIT" '[ "$(grep -c "trying again in 1s" "$tmp/out")" = 2 ] && [ "$(grep -c "^=== " .git/dangle/logs/010.log)" = 3 ]'
+check "then the plan is NOT RUN with the error, not FAILED" 'grep -q "010 NOT RUN  error: 429: The inference service is overloaded" "$tmp/out" && ! grep -q FAILED "$tmp/out"'
+check "a plan not run stays queued and its worktree goes" '[ -f plans/010-a.md ] && [ ! -d .worktrees/plan-010 ] && [ -z "$(git branch --list plan-010)" ]'
+check "a plan not run stops the night" 'grep -q "stopping: the agent could not run" "$tmp/out" && [ ! -f b.txt ] && grep -q "1 not run" .git/dangle/last-run.md'
+check "exit code 1 when a plan was not run" '[ $rc = 1 ]'
+
+# Overloaded once, then fine: the retry lands it.
+cat > "$tmp/agent-flaky" <<EOF
+#!/bin/sh
+if [ ! -f "$tmp/flaky-once" ]; then touch "$tmp/flaky-once"; echo "API Error: 529 Overloaded"; exit 1; fi
+exec "$tmp/agent" "\$@"
+EOF
+chmod +x "$tmp/agent-flaky"
+repo flaky
+printf 'AGENT=%s\nRETRY_WAIT=1s\n' "$tmp/agent-flaky" >> .dangle/config
+plan 010-a.md a.txt
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1; rc=$?
+check "a provider error that clears lands on the retry" '[ -f a.txt ] && [ $rc = 0 ] && grep -q "trying again in 1s" "$tmp/out"'
+
+# The error only in the event stream (claude stream-json `is_error`).
+printf '#!/bin/sh\necho %s\nexit 1\n' "'{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"Credit balance is too low\"}'" > "$tmp/agent-nocredit"
+chmod +x "$tmp/agent-nocredit"
+repo nocredit
+printf 'AGENT=%s\nRETRY_WAIT=0\n' "$tmp/agent-nocredit" >> .dangle/config
+plan 010-a.md a.txt
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "an error in the event stream is found, and RETRY_WAIT=0 does not wait" 'grep -q "010 NOT RUN  Credit balance is too low" "$tmp/out" && ! grep -q "trying again" "$tmp/out"'
+
+# An agent that exits with an error at once is not run, and not tried again.
+printf '#!/bin/sh\necho "unknown flag: --bogus"\nexit 2\n' > "$tmp/agent-badflag"
+chmod +x "$tmp/agent-badflag"
+repo badflag
+printf 'AGENT=%s\nRETRY_WAIT=1s\n' "$tmp/agent-badflag" >> .dangle/config
+plan 010-a.md a.txt
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "an agent that exits with an error at once is NOT RUN with its words" 'grep -q "010 NOT RUN  agent exited 2: unknown flag: --bogus" "$tmp/out" && ! grep -q "trying again" "$tmp/out"'
 
 repo dated
 mkdir -p plans

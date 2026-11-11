@@ -1168,6 +1168,10 @@ run_agent() {
   resolve_agent "$spec" "$(cfg AGENT)"
   say "  agent  $AGENT_LABEL  (log $log)"
   printf '\n=== %s  %s ===\n' "$(date)" "$AGENT_LABEL" >> "$log"
+  # Where this session starts in the log and the event stream, for not_run_reason.
+  AGENT_LOG_OFF=$(wc -c < "$log" | tr -d ' ')
+  AGENT_JSONL_OFF=0
+  [ ! -f "${log%.log}.jsonl" ] || AGENT_JSONL_OFF=$(wc -c < "${log%.log}.jsonl" | tr -d ' ')
   if [ "${FOLLOW:-0}" = 1 ]; then tail -n 0 -f "$log" & tailer=$!; else heartbeat agent "$log"; fi
   rm -f "$log.stalled"
   stall_watch "$dir" "$log"
@@ -1185,6 +1189,7 @@ run_agent() {
     exit "$(cat "$log.rc" 2>/dev/null || echo 1)"
   )
   rc=$?
+  AGENT_RC=$rc
   rm -f "$log.rc"
   stop_heartbeat
   stop_stall_watch
@@ -1202,6 +1207,39 @@ run_agent() {
 # agent_said <log>: the last line the agent wrote in its latest session in the log, for a reason.
 agent_said() {
   awk '/^=== .* ===$/ { last = "" } NF { if ($0 !~ /^=== /) last = $0 } END { print last }' "$1"
+}
+
+# The errors of a provider or a sign-in, not of the work: the model is overloaded or down, the
+# account is out of credit or usage, the key is wrong, the network is gone.
+PROVIDER_ERRORS='(^|[^0-9])(401|403|408|429|500|502|503|504|529)([^0-9]|$)|overloaded|rate.?limit|too many requests|quota|usage limit|credit|billing|insufficient|unavailable|bad gateway|gateway time|unauthori[sz]ed|forbidden|api.?key|authenticat|log ?in|connection (refused|reset|error)|timed? ?out|network|ECONN|ENOTFOUND|EAI_AGAIN'
+
+# not_run_reason <log>: after run_agent, when the agent's latest session did no work (no tool
+# call in the log) and failed in a way that is not the plan's, prints `provider <error>` (the
+# model or account: worth trying again later) or `agent <words>` (it exited with an error: a
+# bad flag, a missing command) and succeeds. A session that worked, or exited 0 having said
+# nothing about an error, is the plan's to answer for: it fails. The caller has checked that
+# there are no commits.
+not_run_reason() {
+  local log="$1" new err
+  new=$(tail -c +$((AGENT_LOG_OFF + 1)) "$log" 2>/dev/null)
+  printf '%s\n' "$new" | grep -q '^→ ' && return 1
+  # An error line from the agent (pi: `error: 429 …`, claude: `API Error: 529 …`, codex: `ERROR: …`),
+  # or the final error in its event stream.
+  err=$(printf '%s\n' "$new" | grep -iE '^[[:space:]]*(\[?(api )?error\]?|fatal)[]: ]' |
+    grep -iE "$PROVIDER_ERRORS" | tail -n 1)
+  if [ -z "$err" ]; then
+    err=$(tail -c +$((AGENT_JSONL_OFF + 1)) "${log%.log}.jsonl" 2>/dev/null |
+      grep -E '"finalError":"|"is_error":true' |
+      sed -n 's/.*"finalError":"\(\([^"\\]\|\\.\)*\)".*/\1/p; t; s/.*"is_error":true.*"result":"\(\([^"\\]\|\\.\)*\)".*/\1/p' |
+      sed 's/\\"/"/g' | tail -n 1)
+  fi
+  if [ -n "$err" ]; then
+    printf 'provider %s\n' "$(printf '%s' "$err" | sed 's/^[[:space:]]*//' | cut -c1-300)"
+  elif [ "${AGENT_RC:-0}" != 0 ]; then
+    printf 'agent exited %s: %s\n' "$AGENT_RC" "$(agent_said "$log" | cut -c1-300)"
+  else
+    return 1
+  fi
 }
 
 # fix_up <fix spec> <worktree> <log>: a fix-up after a failed gate. An agent that exits with an
@@ -1959,7 +1997,7 @@ reap() {
       else
         failed=$((failed + 1))
         result="FAILED   $FAIL_REASON; kept $path"
-        if [ "${t1:-999}" -lt 60 ]; then fast=$((fast + 1)); else fast=0; fi
+        if [ "${t1:-999}" -lt 60 ]; then fast=$((fast + 1)); fastwhy=$FAIL_REASON; else fast=0; fi
       fi
       unclaim "$id"
       note_result "$result"
@@ -1972,7 +2010,8 @@ reap() {
 
 cmd_run() {
   local ids='' rest=0 dry=0 yes=0 agent='' fixagent='' f id queue='' total=0 n=0 landed=0 failed=0 skipped=0 \
-    t0 t1 tstart spec path branch result fast=0 deps summary line watch=0 rescan=0 known STOP=0 elsewhere=0
+    t0 t1 tstart spec path branch result fast=0 fastwhy='' deps summary line watch=0 rescan=0 known STOP=0 elsewhere=0 \
+    notrun=0 NOT_RUN waits w
   FRESH=0 FOLLOW=0
   while [ $# -gt 0 ]; do
     case $1 in
@@ -2087,8 +2126,8 @@ $f"
     reap
     if [ $fast -ge 2 ]; then
       say ""
-      say "  stopping: the agent failed fast twice in a row (out of credit or usage? signed out? model down?)"
-      printf '\nStopped early: the agent failed fast twice in a row.\n' >> "$summary"
+      say "  stopping: the agent failed fast twice in a row; the last: $fastwhy"
+      printf '\nStopped early: the agent failed fast twice in a row; the last: %s\n' "$fastwhy" >> "$summary"
       break
     fi
     claims_seen
@@ -2156,7 +2195,7 @@ $f"
     n=$((n + 1)); branch="$PREFIX$id"; path=$(wt_path "$branch")
     say ""
     say "  $id  $(plan_title "$f")"
-    t0=$(date +%s); result='' t1='' timed=0
+    t0=$(date +%s); result='' t1='' timed=0 NOT_RUN=
     if [ "$PRIVATE" = 0 ] && ! git cat-file -e "refs/heads/$BASE:$PLANS/${f##*/}" 2>/dev/null; then
       result="skipped  (not committed on $BASE)"
     elif [ -f "$STATE/submitted/$id" ] && [ -z "$ids" ]; then
@@ -2165,7 +2204,7 @@ $f"
     if [ -n "$result" ]; then
       skipped=$((skipped + 1)); unclaim "$id"
     else
-      FAIL_REASON=
+      FAIL_REASON= NOT_RUN=
       if [ -d "$path" ] && [ $FRESH = 0 ]; then
         say "  worktree  continuing $path"
       else
@@ -2204,17 +2243,40 @@ $f"
         DANGLE_T_plan="$PLANS/${f##*/}" DANGLE_T_id=$id DANGLE_T_branch=$branch DANGLE_T_base=$BASE \
           DANGLE_T_title=$(plan_title "$f") DANGLE_T_gate=$(gate_desc)
         export DANGLE_T_plan DANGLE_T_id DANGLE_T_branch DANGLE_T_base DANGLE_T_title DANGLE_T_gate
-        t1=$(date +%s)
         timed=1
-        run_agent "$spec" "$path" "$STATE/logs/$id.log" "$(render "$(template prompt.md "$DEFAULT_PROMPT")")"
-        t1=$(( $(date +%s) - t1 ))
-        commit_leftovers "$path"
         # Started on another plan's branch: only the commits since that start are the agent's.
         from="refs/heads/$BASE"
         [ -z "$(git config "branch.$branch.dangleparent" 2>/dev/null)" ] ||
           from=$(git config "branch.$branch.danglebase" 2>/dev/null || printf '%s' "$from")
-        if [ "$(git rev-list --count "$from..$branch")" = 0 ]; then
+        # An agent that never got to work (the provider overloaded or out of credit) is tried
+        # again after each RETRY_WAIT; then the plan is NOT RUN, not FAILED.
+        waits=$(cfg RETRY_WAIT "5m 15m")
+        while :; do
+          NOT_RUN= t1=$(date +%s)
+          run_agent "$spec" "$path" "$STATE/logs/$id.log" "$(render "$(template prompt.md "$DEFAULT_PROMPT")")"
+          t1=$(( $(date +%s) - t1 ))
+          commit_leftovers "$path"
+          [ "$(git rev-list --count "$from..$branch")" = 0 ] || break
+          NOT_RUN=$(not_run_reason "$STATE/logs/$id.log") || { NOT_RUN=; break; }
+          # An agent that exits with an error at once (a bad flag, a missing command) is not run; one
+          # that ran a while and then failed (an agent with no tool lines in the log) is the plan's.
+          case $NOT_RUN in
+            provider\ *) ;;
+            *) [ "$t1" -lt 60 ] || NOT_RUN=; break ;;
+          esac
+          w=${waits%% *}
+          case $w in ''|0|0[smh]) break ;; esac
+          waits=${waits#"$w"}; waits=${waits# }
+          say "  agent  not run (${NOT_RUN#provider }); trying again in $w"
+          printf 'dangle: not run (%s); trying again in %s\n' "${NOT_RUN#provider }" "$w" >> "$STATE/logs/$id.log"
+          sleep "$(to_secs "$w")"
+        done
+        if [ -n "$NOT_RUN" ]; then
+          :
+        elif [ "$(git rev-list --count "$from..$branch")" = 0 ]; then
           FAIL_REASON="the agent made no commits (log $STATE/logs/$id.log)"
+          w=$(agent_said "$STATE/logs/$id.log" | cut -c1-200)
+          [ -z "$w" ] || FAIL_REASON="$FAIL_REASON; it said: $w"
         else
           # Its branch can be built on while it lands (PIPELINE runs here and in other runners).
           mark_ready "$id" "$branch"
@@ -2232,19 +2294,31 @@ $f"
       fi
       if [ "$result" = landed ] || [ "$result" = submitted ]; then
         landed=$((landed + 1)); fast=0
+      elif [ -n "$NOT_RUN" ]; then
+        # Not the plan's failure: the plan stays queued for the next run, its empty worktree goes.
+        notrun=$((notrun + 1))
+        remove_worktree "$branch" force || true
+        result="NOT RUN  ${NOT_RUN#provider } (log $STATE/logs/$id.log); the plan stays queued"
       else
         failed=$((failed + 1))
         result="FAILED   $FAIL_REASON; kept $path"
-        if [ "${t1:-999}" -lt 60 ]; then fast=$((fast + 1)); else fast=0; fi
+        if [ "${t1:-999}" -lt 60 ]; then fast=$((fast + 1)); fastwhy=$FAIL_REASON; else fast=0; fi
       fi
       unclaim "$id"
     fi
     note_result "$result"
     [ "$timed" = 1 ] && record_duration "$(( $(date +%s) - t0 ))"
+    if [ -n "${NOT_RUN:-}" ]; then
+      # The next plan would meet the same provider or the same broken agent.
+      say ""
+      say "  stopping: the agent could not run (${NOT_RUN#provider })"
+      printf '\nStopped early: the agent could not run (%s).\n' "${NOT_RUN#provider }" >> "$summary"
+      break
+    fi
     if [ $fast -ge 2 ]; then
       say ""
-      say "  stopping: the agent failed fast twice in a row (out of credit or usage? signed out? model down?)"
-      printf '\nStopped early: the agent failed fast twice in a row.\n' >> "$summary"
+      say "  stopping: the agent failed fast twice in a row; the last: $fastwhy"
+      printf '\nStopped early: the agent failed fast twice in a row; the last: %s\n' "$fastwhy" >> "$summary"
       break
     fi
   done
@@ -2252,13 +2326,13 @@ $f"
   while [ "$(bg_count)" -gt 0 ]; do reap wait; done
 
   prune_auto
-  printf '\n%s landed, %s failed, %s skipped, %s finished by another run, %s\n' "$landed" "$failed" "$skipped" "$elsewhere" "$(minutes "$tstart" "$(date +%s)")" >> "$summary"
+  printf '\n%s landed, %s failed, %s not run, %s skipped, %s finished by another run, %s\n' "$landed" "$failed" "$notrun" "$skipped" "$elsewhere" "$(minutes "$tstart" "$(date +%s)")" >> "$summary"
   if [ $landed -gt 0 ]; then art_carrot; else fancy && art_stick && say "  no carrot tonight"; fi
   say ""
-  say "  $landed landed · $failed failed · $skipped skipped$([ $elsewhere = 0 ] || printf ' · %s by another run' "$elsewhere") · $(minutes "$tstart" "$(date +%s)")"
+  say "  $landed landed · $failed failed$([ $notrun = 0 ] || printf ' · %s not run' "$notrun") · $skipped skipped$([ $elsewhere = 0 ] || printf ' · %s by another run' "$elsewhere") · $(minutes "$tstart" "$(date +%s)")"
   say "  summary: $summary"
   [ -x "$HOOKS/done" ] && hook "done" "$PRIMARY" "$summary"
-  [ $failed = 0 ]
+  [ $failed = 0 ] && [ $notrun = 0 ]
 }
 
 cmd_status() {

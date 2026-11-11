@@ -197,8 +197,17 @@ If that plan fails, the one built on it does not land either; its worktree is ke
 first, then run it again, or `--fresh` to start it over). A plan waiting for two or more is
 still held until they land.
 
-The night stops early when the agent fails fast twice in a row (out of credit, signed out,
-the model is down) instead of failing every plan in minutes. The computer is kept awake
+A plan whose agent never got to work is **NOT RUN**, not FAILED: the agent's session made no
+tool call and no commit, and it either printed a provider error (`error: 429 …`, `API Error:
+529 …`, a `finalError` or `is_error` in its event stream: overloaded, rate limit, out of
+credit, signed out, network) or exited with an error within a minute (a bad flag). A provider
+error is tried again after each `RETRY_WAIT` (default `5m 15m`; `0` = never). A plan still
+not run keeps its place in the queue (its empty worktree goes), the line in the summary
+quotes the error, and the night stops: the next plan would meet the same outage. So FAILED
+means the plan or the work; NOT RUN means the provider or the agent's setup.
+
+The night also stops when the agent fails fast twice in a row, and says why the last one
+failed, instead of failing every plan in minutes. The computer is kept awake
 (`systemd-inhibit` or `caffeinate`). The summary is in `.git/dangle/last-run.md`, and the
 logs are in `.git/dangle/logs/`.
 
@@ -379,6 +388,7 @@ FIX_AGENT=claude:opus  # fix-ups after a failed gate or merge conflict (default:
 FIXES=1              # fix-up runs after a failed gate
 AGENT_TIMEOUT=4h
 STALL_TIMEOUT=60m    # stop an agent with no new commit for this long; 0 = never
+RETRY_WAIT=5m 15m    # waits before trying a plan again after a provider error; 0 = never
 GATE_TIMEOUT=60m
 REMOTE=origin        # none: never fetch or push
 WORKTREES=.worktrees
