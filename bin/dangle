@@ -2204,7 +2204,7 @@ $f"
     if [ -n "$result" ]; then
       skipped=$((skipped + 1)); unclaim "$id"
     else
-      FAIL_REASON= NOT_RUN=
+      FAIL_REASON='' NOT_RUN=''
       if [ -d "$path" ] && [ $FRESH = 0 ]; then
         say "  worktree  continuing $path"
       else
@@ -2252,7 +2252,7 @@ $f"
         # again after each RETRY_WAIT; then the plan is NOT RUN, not FAILED.
         waits=$(cfg RETRY_WAIT "5m 15m")
         while :; do
-          NOT_RUN= t1=$(date +%s)
+          NOT_RUN='' t1=$(date +%s)
           run_agent "$spec" "$path" "$STATE/logs/$id.log" "$(render "$(template prompt.md "$DEFAULT_PROMPT")")"
           t1=$(( $(date +%s) - t1 ))
           commit_leftovers "$path"
