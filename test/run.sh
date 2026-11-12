@@ -30,9 +30,19 @@ esac
 plan=$(printf '%s\n' "$prompt" | sed -n 's/.*plan in \([^ ,]*\.md\).*/\1/p' | head -n 1)
 case $prompt in *"checks failed"*) rm -f BAD; git add -A; git commit -qm "fix: remove BAD"; exit 0 ;; esac
 # The merge prompt: "Agent: race" resolves the conflict, "Agent: race-bad" commits the markers.
+# "Agent: movebase" resolves, then lands a change on the base while dangle checks the result.
 case $prompt in *"stopped on"*)
-  grep -q '^Agent: race-bad' "$plan" || echo resolved > README
-  git add -A && git commit -q --no-edit; exit 0 ;;
+  if grep -q '^Agent: race-bad' "$plan"; then
+    git add -A && git commit -q --no-edit; exit 0
+  fi
+  echo resolved > README
+  git add -A && git commit -q --no-edit
+  if grep -q '^Agent: movebase' "$plan"; then
+    ( cd "$DANGLE_PRIMARY" && mkdir -p docs && echo note > docs/moved.md &&
+      git add docs/moved.md && git commit -qm "base moved while the agent resolved" &&
+      git push -q origin main )
+  fi
+  exit 0 ;;
 esac
 grep -q '^Agent: idle' "$plan" && exit 0
 # "Agent: stall" works without ever committing (the stall watch stops it).
@@ -382,6 +392,13 @@ plan 010-race.md a.txt 'Agent: race-bad'
 commit
 "$DANGLE" -y > "$tmp/out" 2>&1
 check "an agent merge that leaves conflict markers fails and is undone" '[ ! -f a.txt ] && grep -q "conflicts with main" "$tmp/out" && [ "$(cat .worktrees/plan-010/README)" = plan-edit ] && ! git -C .worktrees/plan-010 rev-parse -q --verify MERGE_HEAD >/dev/null'
+
+repo movemerge
+plan 010-race.md a.txt 'Agent: race
+Agent: movebase'
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "a base that moves while the merge agent works keeps the resolution and lands" '[ -f a.txt ] && [ "$(cat README)" = resolved ] && [ -f docs/moved.md ] && grep -q "1 landed" "$tmp/out" && ! grep -q "FAILED" "$tmp/out"'
 
 # A fix agent that cannot start (a bad flag): the failure says so, not just "conflicts".
 printf '#!/bin/sh\necho "Error: Unknown option: --bogus"\nexit 1\n' > "$tmp/badfix"

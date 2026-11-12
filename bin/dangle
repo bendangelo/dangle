@@ -1479,7 +1479,10 @@ FILES
 # merge_by_agent <worktree> <agent spec> <log> <commit before the merge>: the agent resolves the
 # merge in progress. It counts only when the merge is committed with no conflict marker left.
 merge_by_agent() {
-  local dir="$1" before="$4" rc=0
+  local dir="$1" before="$4" rc=0 target
+  # The merge is against the base as it was when it started. It may move while the agent works:
+  # then the resolution still names this commit, which land() merges the newer base into later.
+  target=$(git -C "$dir" rev-parse -q --verify MERGE_HEAD 2>/dev/null) || target=$BASE
   DANGLE_T_conflicts=$(git -C "$dir" diff --name-only --diff-filter=U | sed 's/^/- /')
   DANGLE_T_base=$BASE; export DANGLE_T_conflicts DANGLE_T_base
   say "  merge  conflicts with $BASE; the agent resolves them"
@@ -1492,7 +1495,10 @@ merge_by_agent() {
     git -C "$dir" add -A && git -C "$dir" commit -q --no-edit || return 1
   fi
   commit_leftovers "$dir"
-  git merge-base --is-ancestor "refs/heads/$BASE" "$(git -C "$dir" rev-parse HEAD)" || return 1
+  # Keep a committed resolution even when the base moved meanwhile: land()'s loop merges the
+  # newer base after the gate. Only a merge that did not take the base it was given is undone.
+  git merge-base --is-ancestor "refs/heads/$BASE" "$(git -C "$dir" rev-parse HEAD)" ||
+    git merge-base --is-ancestor "$target" "$(git -C "$dir" rev-parse HEAD)" || return 1
   ! git -C "$dir" diff --check "$before" HEAD 2>/dev/null | grep -q 'leftover conflict marker'
 }
 

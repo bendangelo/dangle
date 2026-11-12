@@ -148,7 +148,9 @@ both, the base's lines first, and the gate checks the result (unless the base al
 the branch's lines to that file, which would list it twice). Any other conflict goes to the fix
 agent (`FIX_AGENT=`, or `--fix-agent`; default the plan's agent) with `merge-prompt.md`, which
 spends one of the `FIXES`; it counts only when the merge is committed with no conflict marker
-left, and is undone otherwise. A conflict found while landing lets go of the lock first, so no
+left, and is undone otherwise. If the base branch moves while the agent works, the resolution is
+kept and the newer base is merged in after, instead of undoing it. A conflict found while
+landing lets go of the lock first, so no
 other landing waits on the agent, and the gate runs again before the branch lands. `dangle land`
 by hand settles the added-lines kind too and leaves any other conflict for you.
 
