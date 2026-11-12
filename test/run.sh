@@ -841,7 +841,7 @@ printf '%s %s %s\n' "$DANGLE_BRANCH" "$DANGLE_PRUNE_DAYS" "$DANGLE_PRUNE_REASON"
 rm -rf junk
 EOF
 chmod +x .dangle/hooks/prune
-printf 'junk/\n' > .gitignore
+printf 'junk*/\n' > .gitignore
 plan 010-stuck.md a.txt 'Agent: idle'
 commit
 "$DANGLE" -y 010 > "$tmp/out" 2>&1
@@ -857,20 +857,53 @@ check "prune runs the hook with the days and the reason" \
   'grep -q "^plan-010 1 idle$" pruned && [ ! -d .worktrees/plan-010/junk ]'
 check "prune says what it freed" 'grep -q "pruned 1 worktree(s)" "$tmp/out"'
 
+# A worktree pruned once is not pruned again until its build output has grown back: the same
+# idle worktree would otherwise be pruned, and reported, on every pass of every run.
+"$DANGLE" prune > "$tmp/out" 2>&1
+check "a worktree pruned recently is not pruned again" \
+  '! grep -q "pruning  plan-010" "$tmp/out" && [ "$(grep -c "^plan-010 " pruned)" = 1 ]'
+check "a manual prune says there is nothing left to prune" 'grep -q "nothing to prune" "$tmp/out"'
+
+"$DANGLE" prune --all > "$tmp/out" 2>&1
+check "prune --all ignores the memory and runs the hook anyway" \
+  '[ "$(grep -c "^plan-010 " pruned)" = 2 ]'
+
+mkdir -p .worktrees/plan-010/junk2
+dd if=/dev/zero of=.worktrees/plan-010/junk2/big bs=1048576 count=20 2>/dev/null
+"$DANGLE" prune > "$tmp/out" 2>&1
+check "a worktree whose build output grew back is pruned again" \
+  'grep -q "pruning  plan-010" "$tmp/out" && [ "$(grep -c "^plan-010 " pruned)" = 3 ]'
+
 printf 'wip\n' >> .worktrees/plan-010/README
 "$DANGLE" prune --all > "$tmp/out" 2>&1
 check "prune leaves a worktree with uncommitted changes alone" 'grep -q "skip     plan-010" "$tmp/out"'
 git -C .worktrees/plan-010 checkout -q -- README
 
+mkdir -p .worktrees/plan-010/junk3
+dd if=/dev/zero of=.worktrees/plan-010/junk3/big bs=1048576 count=20 2>/dev/null
 plan 020-next.md b.txt
 commit "plan 020"
 "$DANGLE" -y 020 > "$tmp/out" 2>&1
-check "a run prunes idle worktrees before it starts" \
-  'grep -q "pruning  plan-010 (idle)" "$tmp/out" && [ "$(grep -c "^plan-010 " pruned)" -ge 2 ]'
+check "a run prunes an idle worktree whose build output grew back" \
+  'grep -q "pruning  plan-010 (idle)" "$tmp/out" && [ "$(grep -c "^plan-010 " pruned)" = 4 ]'
+check "the run's own housekeeping does not prune it again" \
+  '[ "$(grep -c "^plan-010 " pruned)" = 4 ]'
+
+# A worktree the hook cannot get under the size cap says so, instead of being pruned silently
+# on every run from then on.
+git worktree add -q --detach .worktrees/big main
+mkdir -p .worktrees/big/junk2
+dd if=/dev/zero of=.worktrees/big/junk2/big bs=1048576 count=1100 2>/dev/null
+"$DANGLE" prune --max-gb 1 > "$tmp/out" 2>&1
+check "prune says when a worktree stays over the size cap" \
+  'grep -q "pruning  @big (size" "$tmp/out" &&
+   grep -q "note     @big is still 1.1G after pruning (over PRUNE_MAX_GB=1" "$tmp/out"'
+rm -rf .worktrees/big/junk2
 
 "$DANGLE" prune --rm --all > "$tmp/out" 2>&1
 check "prune --rm removes a plan worktree with no commits of its own" \
   '[ ! -d .worktrees/plan-010 ] && grep -q "removed  plan-010" "$tmp/out"'
+check "removing a worktree forgets what it held" '[ ! -f .git/dangle/pruned/plan-010 ]'
 
 git worktree add -q --detach .worktrees/side main
 mkdir -p .worktrees/side/junk && echo x > .worktrees/side/junk/x

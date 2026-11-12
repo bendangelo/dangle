@@ -312,15 +312,23 @@ dangle calls it, before and after every run, for each worktree that
 
 - has no uncommitted changes (in tracked files), and
 - was last used at least `PRUNE_DAYS` days ago (default 3), or is larger than `PRUNE_MAX_GB`
-  GB (default 0: no size cap).
+  GB (default 0: no size cap), and
+- has not been pruned already: dangle remembers what the worktree held after the hook last ran,
+  and prunes it again only once that has grown back by a tenth (or 16M, whichever is more).
+  Without that, an old worktree stays "idle" for ever and the same build output is pruned, and
+  reported, on every run.
 
 It also runs in detached worktrees (the merge queue, `dangle new` checkouts), but never removes
 them. It never touches a worktree whose plan another dangle is running, one a landing holds, the
 merge queue while it gates, or the worktree you are standing in. `dangle prune` does the same
-by hand (`-n` shows what it would do, `--all` ignores the age and size, `--days` and
-`--max-gb` override the config); `dangle prune --rm` also retires finished plan worktrees as
-the run would, and removes plan worktrees that have no commits of their own and no uncommitted
-files. `dangle list` shows each worktree's size.
+by hand (`-n` shows what it would do, `--all` ignores the age, the size and the memory of what
+was pruned, `--days` and `--max-gb` override the config); `dangle prune --rm` also retires
+finished plan worktrees as the run would, and removes plan worktrees that have no commits of
+their own and no uncommitted files. `dangle list` shows each worktree's size.
+
+A worktree the hook cannot get under the cap says so, because the hook keeps what a rebuild
+needs: `note  @dev-full is still 45.9G after pruning (over PRUNE_MAX_GB=30; pruned again when
+it grows)`. It is pruned again when it has grown back, not on every run.
 
 This is housekeeping, never a verdict: a failing prune hook is reported and the run goes on.
 The project decides the scope, and because only the worktree is pruned, a later run resumes

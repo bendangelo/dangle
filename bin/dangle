@@ -723,6 +723,7 @@ new_worktree() {
   fi
   [ -e "$path" ] && die "$path already exists"
   ensure_excluded
+  forget_pruned "$path" "$branch"
   mkdir -p "$(dirname "$path")"
   if git show-ref -q --verify "refs/heads/$branch"; then
     git worktree add -q "$path" "$branch" || return 1
@@ -758,6 +759,7 @@ remove_worktree() {
     fi
   fi
   git worktree prune
+  forget_pruned "$path" "$branch"
   if [ -z "$keepbranch" ] && git show-ref -q --verify "refs/heads/$branch"; then
     if [ -n "$force" ]; then git branch -q -D "$branch"; else git branch -q -d "$branch"; fi
   fi
@@ -767,6 +769,16 @@ remove_worktree() {
 
 # wt_kb <path>: KiB a worktree uses (`du -sk`), 0 when it fails.
 wt_kb() { du -sk "$1" 2>/dev/null | awk 'NR == 1 { print $1 + 0 }'; }
+
+# remember_pruned <label> <kb>, forget_pruned <path> <branch>: what a worktree held after its
+# last prune. Pruning the same build output again frees nothing, so a worktree is left alone
+# until it has grown back (or --all says otherwise). A recreated worktree starts cold.
+remember_pruned() {
+  mkdir -p "$STATE/pruned"
+  printf '%s\n' "$2" > "$STATE/pruned/$1"
+}
+
+forget_pruned() { rm -f "$STATE/pruned/$(wt_label "$1" "$2")"; }
 
 # human_kb <kb>: 12.3G, 900M, 640K.
 human_kb() {
@@ -862,13 +874,15 @@ prune_worktree() {
   return 0
 }
 
-# prune_all <days> <max-gb> <dry> <all> <rm> <measure>: run the prune hook in every worktree
-# dangle is not using that is idle for <days> days, over <max-gb> GB (0: no cap), or all of
-# them (<all>). <rm> also removes a plan worktree with no commits of its own. <measure> adds
-# sizes and the space freed to the output (a du pass per worktree).
+# prune_all <days> <max-gb> <dry> <all> <rm> <measure> <report-empty>: run the prune hook in
+# every worktree dangle is not using that is idle for <days> days, over <max-gb> GB (0: no cap),
+# or all of them (<all>). <rm> also removes a plan worktree with no commits of its own.
+# <measure> adds sizes and the space freed to the output (a du pass per worktree).
+# <report-empty> says so when there is nothing to prune (a run's housekeeping stays quiet).
 prune_all() {
-  local days="$1" maxg="$2" dry="$3" all="$4" rm="$5" measure="$6"
-  local branch path label ahead kb after reason pruned=0 removed=0 freed=0 over
+  local days="$1" maxg="$2" dry="$3" all="$4" rm="$5" measure="$6" report_empty="${7:-0}"
+  local branch path label ahead kb known was grew after reason over
+  local pruned=0 removed=0 would=0 freed=0
   has_hook prune || [ "$rm" = 1 ] || return 0
   over=$((maxg * 1048576))
   while IFS="$(printf '\t')" read -r path branch; do
@@ -880,8 +894,8 @@ prune_all() {
     fi
     ahead=0
     [ -z "$branch" ] || ahead=$(git rev-list --count "refs/heads/$BASE..refs/heads/$branch" 2>/dev/null || echo 0)
-    kb=0
-    if [ "$measure" = 1 ] || [ "$maxg" != 0 ]; then kb=$(wt_kb "$path"); fi
+    kb=0 known=0
+    if [ "$measure" = 1 ] || [ "$maxg" != 0 ]; then kb=$(wt_kb "$path"); known=1; fi
     reason=''
     if [ "$all" = 1 ]; then reason=all
     elif [ "$(wt_idle_days "$branch" "$path")" -ge "$days" ]; then reason=idle
@@ -900,6 +914,7 @@ prune_all() {
           fi
           if [ "$dry" = 1 ]; then
             say "  would remove $label (no commits of its own)"
+            would=$((would + 1))
           elif remove_worktree "$branch"; then
             removed=$((removed + 1))
             [ "$measure" = 0 ] || freed=$((freed + kb))
@@ -908,12 +923,27 @@ prune_all() {
           continue ;;
       esac
     fi
+    # What this worktree held after its last prune, plus a tenth (16M at least) to show that
+    # build output came back, is what it takes to prune it again. An old worktree that stays
+    # idle, or stays over the cap because the hook keeps what a rebuild needs, is pruned once
+    # and then left alone, instead of on every pass of every run. --all ignores this.
+    if [ "$all" = 0 ]; then
+      was=$(cat "$STATE/pruned/$label" 2>/dev/null || true)
+      case $was in ''|*[!0-9]*) was='' ;; esac
+      if [ -n "$was" ]; then
+        if [ "$known" = 0 ]; then kb=$(wt_kb "$path"); known=1; fi
+        grew=$((was / 10))
+        [ "$grew" -ge 16384 ] || grew=16384
+        [ "$kb" -ge $((was + grew)) ] || continue
+      fi
+    fi
     if [ "$dry" = 1 ]; then
       if [ "$measure" = 0 ]; then
         say "  would prune $label ($reason)"
       else
         say "  would prune $label ($reason, $(human_kb "$kb"))"
       fi
+      would=$((would + 1))
       continue
     fi
     has_hook prune || continue
@@ -924,11 +954,22 @@ prune_all() {
     fi
     prune_worktree "$path" "$branch" "$days" "$reason"
     pruned=$((pruned + 1))
-    if [ "$measure" = 1 ]; then after=$(wt_kb "$path"); freed=$((freed + kb - after)); fi
+    after=$(wt_kb "$path")
+    remember_pruned "$label" "$after"
+    if [ "$measure" = 1 ]; then freed=$((freed + kb - after)); fi
+    # The cap cannot always be reached: the hook keeps dependencies, and what other worktrees
+    # still need. Say so here, once, rather than pruning it silently on every run from now on.
+    if [ "$maxg" != 0 ] && [ "$after" -ge "$over" ]; then
+      say "  note     $label is still $(human_kb "$after") after pruning (over PRUNE_MAX_GB=${maxg}G; pruned again when it grows)"
+    fi
   done <<EOF
 $(wt_entries)
 EOF
-  if [ "$pruned" = 0 ] && [ "$removed" = 0 ]; then return 0; fi
+  if [ "$pruned" = 0 ] && [ "$removed" = 0 ]; then
+    [ "$would" != 0 ] || [ "$report_empty" = 0 ] ||
+      say "  nothing to prune (nothing has grown since the last prune; --all prunes anyway)"
+    return 0
+  fi
   if [ "$measure" = 1 ]; then
     say "  pruned $pruned worktree(s), removed $removed, freed $(human_kb "$freed")"
   else
@@ -1030,6 +1071,7 @@ EOF
         git branch -q -D "$branch"
       fi
       rm -f "$m" "$STATE/seen/$branch"
+      forget_pruned "" "$branch"
       say "  cleared  submitted $id (landed)"
     done
   fi
@@ -1045,6 +1087,7 @@ EOF
       say "  would remove $b (no work of its own)"
     elif git branch -q -D "$b"; then
       rm -f "$STATE/seen/$b"
+      forget_pruned "" "$b"
       say "  removed  $b (no work of its own)"
     fi
   done
@@ -1940,7 +1983,9 @@ dangle: a carrot on a stick for your coding agent.
   dangle rm <branch> [-f]       the teardown hook, then remove a worktree and its branch
   dangle prune [-n] [--days N] [--max-gb N] [--all] [--rm]
                                 run .dangle/hooks/prune in the worktrees idle for N days or
-                                over N GB; --rm also retires finished plan worktrees
+                                over N GB (each once, until its build output grows back;
+                                --all prunes every one again); --rm also retires finished
+                                plan worktrees
   dangle list                   worktrees with ahead/behind, size and changes
   dangle path <branch|id>       print a worktree's path:  cd "$(dangle path 865)"
 
@@ -2821,7 +2866,7 @@ cmd_prune() {
     say "        write one (see the README) or pass --rm to remove worktrees with no work"
     return 0
   fi
-  prune_all "$days" "$maxg" "$dry" "$all" "$rm" 1
+  prune_all "$days" "$maxg" "$dry" "$all" "$rm" 1 1
   return 0
 }
 
