@@ -9,7 +9,7 @@
 set -u
 LC_ALL=C
 export LC_ALL
-VERSION=0.1.30
+VERSION=0.1.31
 
 # The shell's directory when dangle started. remove_worktree must not delete it: a child cannot
 # move its parent shell, so a deleted cwd makes the next prompt warn (mise, for one).
