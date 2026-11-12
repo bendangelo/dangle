@@ -442,6 +442,16 @@ kill $other  # the other dangle dies without finishing 010
 wait $run; rc=$?
 check "a plan whose dangle died is taken over in the same run" '[ $rc = 0 ] && [ -f a.txt ] && [ -f b.txt ] && grep -q "2 landed" "$tmp/out"'
 
+# A run killed between `mkdir` and writing its pid leaves a lock and a claim holding nothing.
+# They must not wait on a process that does not exist.
+repo abandoned
+plan 010-a.md a.txt
+commit
+mkdir -p .git/dangle/land.lock .git/dangle/claims/010
+touch -t 200001010000 .git/dangle/land.lock .git/dangle/claims/010
+"$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
+check "a lock left with no pid is stale: the run lands" '[ $rc = 0 ] && [ -f a.txt ] && grep -q "1 landed" "$tmp/out"'
+
 repo claimfails
 plan 010-a.md a.txt
 plan 020-b.md b.txt
@@ -763,61 +773,27 @@ commit
 "$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
 check "queue: a run lands its plans through the queue" '[ $rc = 0 ] && [ -f a.txt ] && [ -f b.txt ] && [ -f plans/done/020-b.md ] && grep -q "queue  submitted" "$tmp/out" && git log -1 --format=%s | grep -q "^Plan 020-b.md$"'
 
-# ---------------------------------------------------------------- PIPELINE
-# A plan whose agent has finished lands in the background while the runner starts the next; a
-# plan that waits only for a plan landing here starts on its branch and lands after it.
+# ---------------------------------------------------------------- landings run in the run
+# A landing (gate, fix-ups, the merge queue) runs in the same process as the plan: the next plan
+# starts only once it has landed. A PIPELINE= line (from an older dangle) changes nothing.
 slow_gate='#!/bin/sh
-sleep 4
-[ ! -e BAD ] || { echo "BAD file present"; exit 1; }'
+sleep 2'
 export DANGLE_POLL=1
 
-repo pipeline
+repo sequential
 printf 'PIPELINE=1\n' >> .dangle/config
 printf '%s\n' "$slow_gate" > .dangle/hooks/gate
 plan 010-a.md a.txt
 plan 020-b.md b.txt
 commit
 "$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
-check "pipeline: both plans land" '[ $rc = 0 ] && [ -f a.txt ] && [ -f b.txt ] && grep -q "2 landed" "$tmp/out"'
-check "pipeline: the first lands in the background while the next starts" \
-  'grep -q "land   in the background" "$tmp/out" && [ -f .git/dangle/logs/010.land.log ] &&
-   [ "$(grep -n "  020  Plan" "$tmp/out" | head -n 1 | cut -d: -f1)" -lt "$(grep -n "  010  Plan" "$tmp/out" | sed -n 2p | cut -d: -f1)" ]'
-check "pipeline: nothing is left in the background" '[ -z "$(ls .git/dangle/bg)" ] && [ -z "$(ls .git/dangle/ready 2>/dev/null)" ]'
-
-repo stacked
-printf 'PIPELINE=1\n' >> .dangle/config
-printf '%s\n' "$slow_gate" > .dangle/hooks/gate
-plan 010-a.md a.txt
-plan 020-b.md b.txt '<!-- dangle: depends=010 -->'
-commit
-"$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
-check "stacked: a dependent starts on the branch of the plan landing" 'grep -q "worktree  on plan-010: 010 is landing" "$tmp/out"'
-check "stacked: it lands after it, each as its own commit" \
-  '[ $rc = 0 ] && [ -f a.txt ] && [ -f b.txt ] && git log -1 --format=%s | grep -q "^Plan 020-b.md$" &&
-   git log -2 --format=%s | tail -n 1 | grep -q "^Plan 010-a.md$"'
-check "stacked: the parent mark is cleared" '[ -z "$(git config --get-regexp "branch\..*\.dangleparent")" ]'
-
-repo stacked-fail
-printf 'PIPELINE=1\nFIXES=0\n' >> .dangle/config
-printf '%s\n' "$slow_gate" > .dangle/hooks/gate
-plan 010-a.md a.txt 'Agent: broken'
-plan 020-b.md b.txt '<!-- dangle: depends=010 -->'
-commit
-"$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
-check "stacked: when the parent fails, the plan built on it does not land" \
-  '[ $rc = 1 ] && [ ! -f a.txt ] && [ ! -f b.txt ] && grep -q "010 did not land" .git/dangle/results/020 && [ -d .worktrees/plan-020 ]'
-
-repo pipeline-queue
-printf 'PIPELINE=2\nQUEUE=batch\n' >> .dangle/config
-printf '%s\n' "$slow_gate" > .dangle/hooks/gate
-plan 010-a.md a.txt
-plan 020-b.md b.txt '<!-- dangle: depends=010 -->'
-plan 030-c.md c.txt
-commit
-DANGLE_QUEUE_POLL=1 "$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
-check "pipeline: landings in the background go through the merge queue" \
-  '[ $rc = 0 ] && [ -f a.txt ] && [ -f b.txt ] && [ -f c.txt ] && grep -q "3 landed" "$tmp/out" &&
-   grep -q "queue  submitted" .git/dangle/logs/010.land.log && [ "$(git rev-parse main)" = "$(git rev-parse origin/main)" ]'
+check "sequential: both plans land" '[ $rc = 0 ] && [ -f a.txt ] && [ -f b.txt ] && grep -q "2 landed" "$tmp/out"'
+check "sequential: the next plan starts only after the first landed" '
+  first_land=$(grep -n "  land   .* on main" "$tmp/out" | head -n 1 | cut -d: -f1)
+  [ -n "$first_land" ] &&
+  [ "$(grep -n "  010  Plan" "$tmp/out" | head -n 1 | cut -d: -f1)" -lt "$first_land" ] &&
+  [ "$first_land" -lt "$(grep -n "  020  Plan" "$tmp/out" | head -n 1 | cut -d: -f1)" ]'
+check "sequential: nothing is left to land in the background" '[ ! -d .git/dangle/bg ] && [ ! -d .git/dangle/ready ] && [ -z "$(ls .git/dangle/logs/*.land.log 2>/dev/null)" ]'
 unset DANGLE_POLL
 
 # ---------------------------------------------------------------- REMOTE_CLAIMS

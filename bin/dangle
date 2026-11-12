@@ -200,11 +200,6 @@ settings() {
   # QUEUE=batch: a landing joins the merge queue instead of running its own gate (queue_land).
   QUEUE=${DANGLE_QUEUE:-$(cfg QUEUE off)}
   QUEUE_BRANCH=$(cfg QUEUE_BRANCH dangle-queue)
-  # PIPELINE=N: a plan whose agent has finished lands in the background (gate, fix-ups, queue)
-  # while the runner starts the next plan; at most N land at once. 0 = one plan at a time.
-  # A plan that waits only for one landing here starts on that plan's branch.
-  PIPELINE=${DANGLE_PIPELINE:-$(cfg PIPELINE 0)}
-  case $PIPELINE in ''|*[!0-9]*) PIPELINE=0 ;; esac
   # REMOTE_CLAIMS=1: claims are also refs on the remote (refs/dangle/claims/<id>), so runners
   # on different computers never take the same plan. CLAIM_TTL: when a claim is stale.
   REMOTE_CLAIMS=${DANGLE_REMOTE_CLAIMS:-$(cfg REMOTE_CLAIMS 0)}
@@ -296,10 +291,9 @@ run_limited() {
       sleep "$t" & s=$!; wait "$s" && stop_tree "$CHILD" ) < /dev/null > /dev/null 2>&1 &
     watch=$!
   fi
-  # BG names a landing in the background (PIPELINE), which shares this run's pid.
-  echo "$CHILD" > "$STATE/child.$$${BG-}"
+  echo "$CHILD" > "$STATE/child.$$"
   wait "$CHILD"; rc=$?
-  rm -f "$STATE/child.$$${BG-}"
+  rm -f "$STATE/child.$$"
   [ -n "$watch" ] && kill "$watch" 2>/dev/null
   CHILD=
   return $rc
@@ -413,12 +407,27 @@ export_ctx() { # <worktree> <branch>
 
 # ---------------------------------------------------------------- locks and claims
 
+# lock_abandoned <dir>: the lock (or claim) is a leftover of a run that died. Its pid file either
+# names a process that is gone, or is still empty: a live holder writes it at once, so one that
+# stays empty for LOCK_GRACE seconds was killed between mkdir and the write.
+LOCK_GRACE=10
+lock_abandoned() {
+  local pid age
+  pid=$(cat "$1/pid" 2>/dev/null || true)
+  if [ -n "$pid" ]; then
+    kill -0 "$pid" 2>/dev/null && return 1
+    return 0
+  fi
+  age=$(( $(date +%s) - $(file_epoch "$1") ))
+  [ "$age" -ge "$LOCK_GRACE" ]
+}
+
 # take_lock <dir> <what>: waits for a lock held by a live process; clears a dead one's.
 take_lock() {
   local dir="$1" what="$2" pid said=''
   while ! mkdir "$dir" 2>/dev/null; do
+    if lock_abandoned "$dir"; then rm -rf "$dir"; continue; fi
     pid=$(cat "$dir/pid" 2>/dev/null || true)
-    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -rf "$dir"; continue; fi
     [ -n "$said" ] || { say "  waiting for $what${pid:+ (pid $pid)}"; said=1; }
     sleep 3
   done
@@ -432,9 +441,8 @@ claim() {
   while ! mkdir "$dir" 2>/dev/null; do
     pid=$(cat "$dir/pid" 2>/dev/null || true)
     [ "$pid" = $$ ] && return 0
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then return 1; fi
-    [ -n "$pid" ] || sleep 1
-    rm -rf "$dir"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 1
+    if lock_abandoned "$dir"; then rm -rf "$dir"; else sleep 1; fi
   done
   echo $$ > "$dir/pid"
 }
@@ -516,32 +524,12 @@ remote_claim() {
   return 1
 }
 
-# ready_live <id>: the plan's agent has finished here and its landing is under way (PIPELINE):
-# $STATE/ready/<id> holds its branch and the pid of the run landing it.
-ready_live() {
-  local pid
-  [ -f "$STATE/ready/$1" ] || return 1
-  pid=$(sed -n 2p "$STATE/ready/$1")
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
-}
-mark_ready() { mkdir -p "$STATE/ready" && printf '%s\n%s\n' "$2" $$ > "$STATE/ready/$1"; }
-
 cleanup() {
   stop_heartbeat
   [ -n "$CHILD" ] && stop_tree "$CHILD"
-  local d c
-  # Landings in the background (PIPELINE) stop with the run; their branches are kept.
-  for d in "$STATE"/bg/$$.*; do
-    [ -f "$d/pid" ] && stop_tree "$(cat "$d/pid")"
-    rm -rf "$d"
-  done
+  local d
   # An agent started in a subshell (run_agent) records its pid here.
-  for c in "$STATE"/child.$$ "$STATE"/child.$$.*; do
-    [ -f "$c" ] && stop_tree "$(cat "$c")" && rm -f "$c"
-  done
-  for d in "$STATE"/ready/*; do
-    [ -f "$d" ] && [ "$(sed -n 2p "$d")" = $$ ] && rm -f "$d"
-  done
+  [ -f "$STATE/child.$$" ] && stop_tree "$(cat "$STATE/child.$$")" && rm -f "$STATE/child.$$"
   for d in "$STATE"/claims/*; do [ -d "$d" ] && unclaim "${d##*/}"; done
   drop_lock "$STATE/land.lock"
   drop_lock "$STATE/queue.lock"
@@ -1189,59 +1177,6 @@ running_elsewhere() {
   done
   # Another computer's run (REMOTE_CLAIMS=1).
   claim_host "$1" > /dev/null
-}
-
-# first_runnable <files>: first_ready, plus (PIPELINE) the first plan that waits only for one
-# plan landing here: it starts on that plan's branch (stack_parent).
-first_runnable() {
-  local g
-  for g in $1; do
-    [ -z "$(unmet "$g")" ] && { printf '%s' "$g"; return 0; }
-    [ -n "$(stack_parent "$g")" ] && { printf '%s' "$g"; return 0; }
-  done
-  return 1
-}
-
-# stack_parent <file>: with PIPELINE, the id of the one plan this plan still waits for, when
-# that plan's agent has finished here and it is landing (its branch can be built on).
-stack_parent() {
-  local u r b
-  [ "$PIPELINE" -gt 0 ] || return 0
-  u=$(unmet "$1")
-  [ -n "$u" ] && [ "$(printf '%s\n' "$u" | wc -l | tr -d ' ')" = 1 ] || return 0
-  b="$PREFIX$(plan_id "$1")"
-  for r in "$STATE"/ready/*; do
-    [ -f "$r" ] && is_id "$u" "${r##*/}" && ready_live "${r##*/}" || continue
-    # A kept worktree is continued as it is: only one started on this parent may go on.
-    if [ -d "$(wt_path "$b")" ] && [ "${FRESH:-0}" = 0 ] &&
-      [ "$(git config "branch.$b.dangleparent" 2>/dev/null)" != "${r##*/}" ]; then
-      return 0
-    fi
-    printf '%s' "${r##*/}"
-    return 0
-  done
-  return 0
-}
-
-# wait_parent <branch>: a plan started on another plan's branch (PIPELINE) lands after it. 1
-# (with FAIL_REASON) when that plan stopped without landing.
-wait_parent() {
-  local p said=''
-  p=$(git config "branch.$1.dangleparent" 2>/dev/null) || return 0
-  [ -n "$p" ] || return 0
-  while :; do
-    synced
-    if is_landed "$p"; then git config --unset "branch.$1.dangleparent"; return 0; fi
-    if ! ready_live "$p"; then
-      # It may have landed between the two looks.
-      synced
-      is_landed "$p" && { git config --unset "branch.$1.dangleparent"; return 0; }
-      fail "it was started on $p's branch, and $p did not land (land $p, then this plan again; --fresh starts it over)"
-      return 1
-    fi
-    [ -n "$said" ] || { say "  land   waiting for $p to land first"; said=1; }
-    sleep "${DANGLE_POLL:-30}"
-  done
 }
 
 without() { printf '%s\n' "$1" | grep -Fxv -- "$2"; }
@@ -2022,8 +1957,7 @@ Run options:
   -q, --quiet           no art
 
 Environment: DANGLE_AGENT, DANGLE_FIX_AGENT, DANGLE_REMOTE (none = do not fetch or push),
-DANGLE_QUEUE (batch = the merge queue), DANGLE_PIPELINE (landings in the background),
-DANGLE_REMOTE_CLAIMS (1 = claims shared through the remote).
+DANGLE_QUEUE (batch = the merge queue), DANGLE_REMOTE_CLAIMS (1 = claims shared through the remote).
 Configuration: ~/.config/dangle/config (yours: AGENT=, ALIAS_), then the repository's
 .dangle/config, .dangle/copy, .dangle/hooks/*, .dangle/prompt.md (see README).
 EOF
@@ -2094,78 +2028,6 @@ idle() {
   trap 'cleanup; exit 130' INT TERM
   [ $STOP = 0 ] || { say ""; say "  stopped watching"; return 1; }
   synced
-}
-
-# ---------------------------------------------------------------- landing in the background
-# PIPELINE=N: once a plan's agent has finished, land() (gate, fix-ups, the merge queue) runs in a
-# background subshell and the run starts the next plan. Its output goes to
-# $STATE/logs/<id>.land.log; its result to $STATE/bg/<pid>.<id>/result, which reap takes up.
-# The subshell shares the run's pid, so the plan's claim and the queue entry stay the run's.
-
-bg_count() {
-  local d k=0
-  for d in "$STATE"/bg/$$.*; do [ -d "$d" ] && k=$((k + 1)); done
-  printf '%s' $k
-}
-
-# bg_land <id> <branch> <plan file> <fix agent> <worktree> <t0> <agent secs>
-bg_land() {
-  local d="$STATE/bg/$$.$1" log="$STATE/logs/$1.land.log"
-  mkdir -p "$d"
-  printf '%s\n' "$3" > "$d/plan"; printf '%s\n' "$5" > "$d/path"
-  plan_title "$3" > "$d/title"
-  printf '%s %s %s\n' "$6" "$7" "$n" > "$d/times"
-  say "  land   in the background (log $log); on to the next plan"
-  (
-    trap - EXIT INT TERM
-    BG=".$1" LAND_RESULT='' FAIL_REASON='' r=failed
-    if wait_parent "$2" && land "$2" "$3" "$4" 0; then r=${LAND_RESULT:-landed}; fi
-    rm -f "$STATE/ready/$1"
-    printf '%s\n%s\n' "$r" "$FAIL_REASON" > "$d/result.tmp" && mv "$d/result.tmp" "$d/result"
-  ) > "$log" 2>&1 < /dev/null &
-  echo $! > "$d/pid"
-}
-
-# reap [wait]: takes up the background landings that have finished, as cmd_run takes up a plan
-# it landed itself (its locals: landed, failed, fast, summary, total). With `wait`, waits until
-# at least one has finished.
-reap() {
-  local d id f t0 t1 n result path branch pid got=0 FAIL_REASON title
-  while :; do
-    for d in "$STATE"/bg/$$.*; do
-      [ -d "$d" ] || continue
-      id=${d##*/$$.}
-      if [ ! -f "$d/result" ]; then
-        pid=$(cat "$d/pid" 2>/dev/null || true)
-        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && continue
-        printf 'failed\nthe landing stopped (log %s)\n' "$STATE/logs/$id.land.log" > "$d/result"
-      fi
-      result=$(sed -n 1p "$d/result"); FAIL_REASON=$(sed -n 2p "$d/result")
-      f=$(cat "$d/plan"); path=$(cat "$d/path"); title=$(cat "$d/title")
-      branch=$(basename "$path")
-      read -r t0 t1 n < "$d/times"
-      rm -rf "$d"
-      got=1
-      say ""
-      say "  $id  $title"
-      grep -E '^  (land|queue|gate) ' "$STATE/logs/$id.land.log" 2>/dev/null | tail -n 1
-      if [ "$result" = landed ] || [ "$result" = submitted ]; then
-        landed=$((landed + 1)); fast=0
-      else
-        failed=$((failed + 1))
-        result="FAILED   $FAIL_REASON; kept $path"
-        if [ "${t1:-999}" -lt 60 ]; then fast=$((fast + 1)); fastwhy=$FAIL_REASON; else fast=0; fi
-      fi
-      unclaim "$id"
-      plan_tick
-      [ -d "$path" ] && stamp_worktree "$branch"
-      retire_all 0 0
-      note_result "$result"
-      record_duration "$(( $(date +%s) - t0 ))"
-    done
-    [ "${1-}" = wait ] && [ $got = 0 ] && [ "$(bg_count)" -gt 0 ] || break
-    sleep "${DANGLE_QUEUE_POLL:-3}"
-  done
 }
 
 cmd_run() {
@@ -2280,17 +2142,8 @@ $f"
   # is running (a second terminal) waits for it to land.
   # A plan written (and, unless the plans are private, committed) while dangle runs joins the
   # queue at its end. With --watch an empty or blocked queue waits for more instead of ending.
-  local pending=$queue waiting said='' parent from
-  mkdir -p "$STATE/bg"
+  local pending=$queue waiting said=''
   while :; do
-    # Landings in the background that finished (PIPELINE).
-    reap
-    if [ $fast -ge 2 ]; then
-      say ""
-      say "  stopping: the agent failed fast twice in a row; the last: $fastwhy"
-      printf '\nStopped early: the agent failed fast twice in a row; the last: %s\n' "$fastwhy" >> "$summary"
-      break
-    fi
     claims_seen
     [ $rescan = 0 ] || pick_up
     prune
@@ -2303,15 +2156,7 @@ $f"
     fi
     # A plan another dangle runs stays queued: it lands there (prune drops it), or comes back
     # here when that dangle dies.
-    if ! f=$(first_runnable "$(mine "$pending")"); then
-      # What waits may wait for a plan landing here in the background: let one finish first.
-      if [ "$(bg_count)" -gt 0 ]; then
-        [ "$said" = landing ] || say "  waiting for a landing in the background"
-        said=landing
-        reap wait
-        synced
-        continue
-      fi
+    if ! f=$(first_ready "$(mine "$pending")"); then
       waiting=''
       for f in $pending; do
         if running_elsewhere "$(plan_id "$f")"; then waiting="$waiting $(plan_id "$f")"; continue; fi
@@ -2371,20 +2216,7 @@ $f"
       else
         [ -d "$path" ] && remove_worktree "$branch" force
         git show-ref -q --verify "refs/heads/$branch" && [ $FRESH = 1 ] && git branch -q -D "$branch"
-        parent=$(stack_parent "$f")
-        from=$(sed -n 1p "$STATE/ready/$parent" 2>/dev/null)
-        if [ -n "$parent" ] && [ -n "$from" ] && git show-ref -q --verify "refs/heads/$from"; then
-          # PIPELINE: it waits only for a plan landing here; start on that plan's branch, and
-          # land after it.
-          say "  worktree  on $from: $parent is landing"
-          if new_worktree "$branch" "refs/heads/$from"; then
-            git config "branch.$branch.dangleparent" "$parent"
-          else
-            FAIL_REASON="could not create the worktree"
-          fi
-        else
-          new_worktree "$branch" || FAIL_REASON="could not create the worktree"
-        fi
+        new_worktree "$branch" || FAIL_REASON="could not create the worktree"
       fi
       spec=${agent:-$(plan_field "$f" agent)}
       spec=${spec:-$(cfg AGENT)}
@@ -2405,10 +2237,6 @@ $f"
           DANGLE_T_title=$(plan_title "$f") DANGLE_T_gate=$(gate_desc)
         export DANGLE_T_plan DANGLE_T_id DANGLE_T_branch DANGLE_T_base DANGLE_T_title DANGLE_T_gate
         timed=1
-        # Started on another plan's branch: only the commits since that start are the agent's.
-        from="refs/heads/$BASE"
-        [ -z "$(git config "branch.$branch.dangleparent" 2>/dev/null)" ] ||
-          from=$(git config "branch.$branch.danglebase" 2>/dev/null || printf '%s' "$from")
         # An agent that never got to work (the provider overloaded or out of credit) is tried
         # again after each RETRY_WAIT; then the plan is NOT RUN, not FAILED.
         waits=$(cfg RETRY_WAIT "5m 15m")
@@ -2417,7 +2245,7 @@ $f"
           run_agent "$spec" "$path" "$STATE/logs/$id.log" "$(render "$(template prompt.md "$DEFAULT_PROMPT")")"
           t1=$(( $(date +%s) - t1 ))
           commit_leftovers "$path"
-          [ "$(git rev-list --count "$from..$branch")" = 0 ] || break
+          [ "$(git rev-list --count "refs/heads/$BASE..$branch")" = 0 ] || break
           NOT_RUN=$(not_run_reason "$STATE/logs/$id.log") || { NOT_RUN=; break; }
           # An agent that exits with an error at once (a bad flag, a missing command) is not run; one
           # that ran a while and then failed (an agent with no tool lines in the log) is the plan's.
@@ -2434,23 +2262,15 @@ $f"
         done
         if [ -n "$NOT_RUN" ]; then
           :
-        elif [ "$(git rev-list --count "$from..$branch")" = 0 ]; then
+        elif [ "$(git rev-list --count "refs/heads/$BASE..$branch")" = 0 ]; then
           FAIL_REASON="the agent made no commits (log $STATE/logs/$id.log)"
           w=$(agent_said "$STATE/logs/$id.log" | cut -c1-200)
           [ -z "$w" ] || FAIL_REASON="$FAIL_REASON; it said: $w"
         else
-          # Its branch can be built on while it lands (PIPELINE runs here and in other runners).
-          mark_ready "$id" "$branch"
-          if [ "$PIPELINE" -gt 0 ]; then
-            while [ "$(bg_count)" -ge "$PIPELINE" ]; do reap wait; done
-            bg_land "$id" "$branch" "$f" "${fixagent:-$spec}" "$path" "$t0" "$t1"
-            continue
-          fi
           LAND_RESULT=
-          if wait_parent "$branch" && land "$branch" "$f" "${fixagent:-$spec}" 0; then
+          if land "$branch" "$f" "${fixagent:-$spec}" 0; then
             result=${LAND_RESULT:-landed}
           fi
-          rm -f "$STATE/ready/$id"
         fi
       fi
       if [ "$result" = landed ] || [ "$result" = submitted ]; then
@@ -2487,8 +2307,6 @@ $f"
       break
     fi
   done
-  # The landings still under way in the background.
-  while [ "$(bg_count)" -gt 0 ]; do reap wait; done
 
   prune_auto
   printf '\n%s landed, %s failed, %s not run, %s skipped, %s finished by another run, %s\n' "$landed" "$failed" "$notrun" "$skipped" "$elsewhere" "$(minutes "$tstart" "$(date +%s)")" >> "$summary"
@@ -2511,7 +2329,6 @@ cmd_status() {
     host=''
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       state="running"
-      ready_live "$id" && state="landing"
     elif host=$(claim_host "$id"); then state="running"
     elif [ -f "$STATE/submitted/$id" ]; then state="submitted"
     elif [ -n "$deps" ]; then state="waiting"
