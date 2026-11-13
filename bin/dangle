@@ -180,6 +180,13 @@ settings() {
   WORKTREES=$(cfg WORKTREES .worktrees)
   PREFIX=$(cfg BRANCH_PREFIX plan-)
   FIXES=$(cfg FIXES 1)
+  # A conflicting merge of the base branch is resolved by the fix agent too, out of a budget of its
+  # own (default FIXES): a base that keeps landing while the agent works can need two or three
+  # resolutions in one landing, and spending the gate's fix-ups on them leaves neither. 0, like
+  # FIXES=0, means no agent resolves a merge. MERGE_ROUNDS caps how many times one landing takes a
+  # base that moved back in.
+  MERGE_FIXES=$(cfg MERGE_FIXES "${FIXES:-2}")
+  MERGE_ROUNDS=$(cfg MERGE_ROUNDS 3)
   MAX_LINES=$(cfg MAX_LINES 300)
   AGENT_SECS=$(to_secs "$(cfg AGENT_TIMEOUT 4h)")
   GATE_SECS=$(to_secs "$(cfg GATE_TIMEOUT 60m)")
@@ -195,6 +202,8 @@ settings() {
   case $PRUNE_DAYS in ''|*[!0-9]*) PRUNE_DAYS=3 ;; esac
   case $PRUNE_MAX_GB in ''|*[!0-9]*) PRUNE_MAX_GB=0 ;; esac
   case $PRUNE_AFTER_RUNS in ''|*[!0-9]*) PRUNE_AFTER_RUNS=2 ;; esac
+  case $MERGE_FIXES in ''|*[!0-9]*) MERGE_FIXES=$FIXES ;; esac
+  case $MERGE_ROUNDS in ''|*[!0-9]*) MERGE_ROUNDS=3 ;; esac
   PLAN_COUNT=$(cat "$STATE/plans" 2>/dev/null || true)
   case $PLAN_COUNT in ''|*[!0-9]*) PLAN_COUNT=0 ;; esac
   # QUEUE=batch: a landing joins the merge queue instead of running its own gate (queue_land).
@@ -1264,6 +1273,10 @@ conflicts. The merge is in progress in this worktree (see git status); the confl
 Resolve every conflict so both sides'"'"' work survives. {{base}} has already landed, so its names
 and shapes win: adapt this branch'"'"'s side to them. Then git add the files and finish the merge with
 git commit --no-edit, and run the project'"'"'s checks: {{gate}}
+Files git cannot merge as text are listed below: take one side for each of them (git checkout
+--theirs -- <file>, or --ours) and leave recording them again to the project'"'"'s own tooling,
+rather than reading or comparing them:
+{{binary_conflicts}}
 Do not abort the merge, rebase, push, or edit the plan file.'
 
 DEFAULT_AUDIT_PROMPT='Do not change, create or delete any file, and do not commit: this is a read-only check.
@@ -1428,7 +1441,15 @@ regate_needed() { # <old base> <new base>
 # ---------------------------------------------------------------- landing
 
 FAIL_REASON=
-fail() { FAIL_REASON=$1; return 1; }
+# land_note <text>: one line in this landing's log ($STATE/logs/<id>.landing.log, set by land()).
+# The gate keeps its own log; this one says what was merged and why a landing stopped, once the
+# terminal output is gone.
+LAND_LOG=
+land_note() {
+  [ -n "$LAND_LOG" ] || return 0
+  printf '%s %s\n' "$(date '+%F %T')" "$1" >> "$LAND_LOG"
+}
+fail() { FAIL_REASON=$1; land_note "failed: $1"; return 1; }
 
 # done_on_disk <plan file>: a private plan that landed moves to the done folder.
 done_on_disk() {
@@ -1476,63 +1497,138 @@ FILES
   say "  merge  settled $total conflict(s) where both sides added lines: $(printf '%s' "$files" | tr '\n' ' ')"
 }
 
+# is_binary <worktree> <rev>:path: git's own test for a file it cannot merge as text: a NUL
+# byte in the first 8 KiB.
+is_binary() {
+  git -C "$1" cat-file blob "$2" 2>/dev/null | head -c 8192 | od -An -tx1 | tr ' ' '\n' | grep -qx 00
+}
+
+# conflicted_binary <worktree>: the conflicted files with no text to merge (a recorded baseline,
+# an image, an archive). No one settles one of those by reading it: one side is taken and the
+# project records the file again. An agent reading a PNG spends an hour learning that.
+conflicted_binary() {
+  local dir="$1" f
+  git -C "$dir" diff --name-only --diff-filter=U | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if is_binary "$dir" ":2:$f"; then printf '%s\n' "$f"; fi
+  done
+}
+
+# conflicted_text <worktree>: the conflicted files an agent can reason about.
+conflicted_text() {
+  local dir="$1" f
+  git -C "$dir" diff --name-only --diff-filter=U | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if ! is_binary "$dir" ":2:$f"; then printf '%s\n' "$f"; fi
+  done
+}
+
 # merge_by_agent <worktree> <agent spec> <log> <commit before the merge>: the agent resolves the
 # merge in progress. It counts only when the merge is committed with no conflict marker left.
+# MERGE_WHY says why it was not accepted, on every path that refuses it.
 merge_by_agent() {
-  local dir="$1" before="$4" rc=0 target
-  # The merge is against the base as it was when it started. It may move while the agent works:
-  # then the resolution still names this commit, which land() merges the newer base into later.
+  local dir="$1" before="$4" rc=0 target head
+  # The merge is against the base as it was when it started. It may move while the agent works;
+  # merge_base_in takes the newer base in after it, and a resolution that did not take the base it
+  # was given is undone there.
   target=$(git -C "$dir" rev-parse -q --verify MERGE_HEAD 2>/dev/null) || target=$BASE
   DANGLE_T_conflicts=$(git -C "$dir" diff --name-only --diff-filter=U | sed 's/^/- /')
-  DANGLE_T_base=$BASE; export DANGLE_T_conflicts DANGLE_T_base
+  DANGLE_T_binary_conflicts=$(conflicted_binary "$dir" | sed 's/^/- /')
+  DANGLE_T_base=$BASE; export DANGLE_T_conflicts DANGLE_T_binary_conflicts DANGLE_T_base
   say "  merge  conflicts with $BASE; the agent resolves them"
   run_agent "$2" "$dir" "$3" "$(render "$(template merge-prompt.md "$DEFAULT_MERGE_PROMPT")")" || rc=$?
   if [ -n "$(git -C "$dir" diff --name-only --diff-filter=U)" ]; then
     [ $rc = 0 ] || MERGE_WHY="the agent exited $rc and left them: $(agent_said "$3")"
+    [ -n "$MERGE_WHY" ] || MERGE_WHY="the agent stopped with the conflicts still unmerged"
     return 1
   fi
   if git -C "$dir" rev-parse -q --verify MERGE_HEAD >/dev/null; then
-    git -C "$dir" add -A && git -C "$dir" commit -q --no-edit || return 1
+    git -C "$dir" add -A && git -C "$dir" commit -q --no-edit ||
+      { MERGE_WHY="the resolved merge could not be committed"; return 1; }
   fi
   commit_leftovers "$dir"
-  # Keep a committed resolution even when the base moved meanwhile: land()'s loop merges the
-  # newer base after the gate. Only a merge that did not take the base it was given is undone.
-  git merge-base --is-ancestor "refs/heads/$BASE" "$(git -C "$dir" rev-parse HEAD)" ||
-    git merge-base --is-ancestor "$target" "$(git -C "$dir" rev-parse HEAD)" || return 1
-  ! git -C "$dir" diff --check "$before" HEAD 2>/dev/null | grep -q 'leftover conflict marker'
+  head=$(git -C "$dir" rev-parse HEAD)
+  git merge-base --is-ancestor "$target" "$head" 2>/dev/null ||
+    { MERGE_WHY="the resolution did not take $BASE@$(git -C "$dir" rev-parse --short "$target")"; return 1; }
+  git -C "$dir" diff --check "$before" HEAD 2>/dev/null | grep -q 'leftover conflict marker' &&
+    { MERGE_WHY="the resolution has a leftover conflict marker"; return 1; }
+  return 0
 }
 
 # merge_base_in <worktree> <interactive> [agent spec] [log]: merges the base branch into the
 # worktree's branch. A conflict where both sides added lines is settled by itself; any other one
-# goes to the agent, when one is given, or stops (by hand: with the merge left for you).
-# MERGED_BY says who settled it: empty (a clean merge), auto or agent. MERGE_WHY says why the
-# agent did not, when it failed rather than gave up.
+# goes to the agent, when one is given, or stops (by hand: with the merge left for you). A
+# conflict on a file with no text to merge goes to no agent: it is reported instead, with the
+# files, so the resolution is a checkout and a re-record, not an hour of reading.
+# The base can move while an agent works. The resolution is kept, and the newer base is taken in
+# before this returns (MERGE_ROUNDS rounds at most), because land() would merge it again right
+# after anyway: one landing, one resolution, not two.
+# MERGED_BY says who settled it: empty (a clean merge), auto or agent. MERGE_WHY says why it
+# stopped, on every path.
 MERGED_BY=
 MERGE_WHY=
 merge_base_in() {
-  local dir="$1" before
+  local dir="$1" agent="${3-}" log="${4-}" before rounds=0 binary
   MERGED_BY='' MERGE_WHY=''
   before=$(git -C "$dir" rev-parse HEAD)
-  git -C "$dir" merge -q --no-edit "refs/heads/$BASE" >/dev/null 2>&1 && return 0
-  if settle_added "$dir"; then MERGED_BY=auto; return 0; fi
-  if [ "${2-}" = 1 ]; then
-    err "the merge of $BASE into $1 conflicts: resolve it there, commit, and run dangle land again"
-    return 1
-  fi
-  if [ -n "${3-}" ] && merge_by_agent "$dir" "$3" "$4" "$before"; then MERGED_BY=agent; return 0; fi
+  while :; do
+    rounds=$((rounds + 1))
+    if git -C "$dir" merge -q --no-edit "refs/heads/$BASE" >/dev/null 2>&1; then
+      :
+    elif settle_added "$dir"; then
+      [ "$MERGED_BY" = agent ] || MERGED_BY=auto
+    elif [ "${2-}" = 1 ]; then
+      err "the merge of $BASE into $1 conflicts: resolve it there, commit, and run dangle land again"
+      MERGE_WHY="the merge of $BASE is left in progress"
+      land_note "merge in progress: $(git -C "$dir" diff --name-only --diff-filter=U | tr '\n' ' ')"
+      return 1
+    else
+      binary=$(conflicted_binary "$dir")
+      if [ -z "$agent" ]; then
+        MERGE_WHY="no agent for a merge (land --fix, or FIX_AGENT in .dangle/config)"
+      elif [ -n "$binary" ] && [ -z "$(conflicted_text "$dir")" ]; then
+        MERGE_WHY="only binary conflicts ($(printf '%s' "$binary" | tr '\n' ' ')): take one side and record them again, no agent can merge them"
+      elif merge_by_agent "$dir" "$agent" "$log" "$before"; then
+        MERGED_BY=agent
+      else
+        [ -n "$MERGE_WHY" ] || MERGE_WHY="the agent could not settle the merge"
+      fi
+      [ "$MERGED_BY" = agent ] || break
+    fi
+    # Take the base as it is now, not as it was when the merge started.
+    git -C "$dir" merge-base --is-ancestor "refs/heads/$BASE" "$(git -C "$dir" rev-parse HEAD)" &&
+      return 0
+    if [ $rounds -ge "$MERGE_ROUNDS" ]; then
+      MERGE_WHY="$BASE moved $rounds times while resolving: try again"
+      break
+    fi
+    if [ "$rounds" = 1 ]; then
+      say "  merge  $BASE moved while resolving; taking it in again"
+    fi
+  done
+  land_note "merge stopped: ${MERGE_WHY:-$BASE conflicts}"
+  land_note "left unmerged: $(git -C "$dir" diff --name-only --diff-filter=U | tr '\n' ' ')"
   git -C "$dir" merge --abort 2>/dev/null
   git -C "$dir" reset -q --hard "$before"
   return 1
 }
 
-# merge_spending_fixes: land()'s merge of the base branch; an agent resolving a conflict spends
-# one of the FIXES fix-ups. Reads and sets land()'s locals (path, inter, fix, alog, fixes).
+# merge_spending_fixes: land()'s merge of the base branch, resolved by the fix agent out of its
+# own budget (MERGE_FIXES), so a long merge cannot spend the gate's fix-ups or the other way
+# round. Reads and sets land()'s locals (path, inter, fix, alog, merges).
 merge_spending_fixes() {
-  local spare=''
-  [ "$fixes" -lt "$FIXES" ] && spare=$fix
-  merge_base_in "$path" "$inter" "$spare" "$alog" ||
-    { fail "conflicts with $BASE${MERGE_WHY:+ ($MERGE_WHY)}"; return 1; }
-  [ "$MERGED_BY" != agent ] || fixes=$((fixes + 1))
+  local spare='' why=''
+  [ "$merges" -ge "$MERGE_FIXES" ] || spare=$fix
+  [ -n "$fix" ] || why="no agent for a merge (land --fix, or FIX_AGENT in .dangle/config)"
+  [ -n "$spare" ] || why="the merge fix-ups are spent (MERGE_FIXES=$MERGE_FIXES)"
+  if merge_base_in "$path" "$inter" "$spare" "$alog"; then
+    [ "$MERGED_BY" != agent ] || merges=$((merges + 1))
+    return 0
+  fi
+  [ -n "$MERGE_WHY" ] || MERGE_WHY=$why
+  say "  merge  stopped: $MERGE_WHY"
+  fail "conflicts with $BASE${MERGE_WHY:+ ($MERGE_WHY)}"
+  return 1
 }
 
 # ---------------------------------------------------------------- the merge queue
@@ -1832,14 +1928,16 @@ cmd_queue() {
 NOW=
 NOGATE=
 land() {
-  local branch="$1" plan="$2" fix="$3" inter="$4" keep="${5-}" path id log alog fixes=0 tries=0 old new tree sha msg
+  local branch="$1" plan="$2" fix="$3" inter="$4" keep="${5-}" path id log alog fixes=0 merges=0 tries=0 old new tree sha msg
   path=$(wt_path "$branch")
   [ -d "$path" ] || fail "no worktree at $path" || return 1
   [ -z "$(git -C "$path" status --porcelain --untracked-files=no)" ] ||
     fail "$path has uncommitted changes" || return 1
   id=${plan:+$(plan_id "$plan")}
   log="$STATE/logs/${id:-$branch}.gate.log" alog="$STATE/logs/${id:-$branch}.log"
+  LAND_LOG="$STATE/logs/${id:-$branch}.landing.log"
   export_ctx "$path" "$branch"
+  land_note "landing $branch onto $BASE@$(git rev-parse --short "refs/heads/$BASE" 2>/dev/null)"
 
   synced
   merge_spending_fixes || return 1

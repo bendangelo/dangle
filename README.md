@@ -146,13 +146,23 @@ A merge of the base branch that conflicts does not end the plan. Where both side
 lines at the same place (two plans adding to one list, `match` or doc section), dangle keeps
 both, the base's lines first, and the gate checks the result (unless the base also added one of
 the branch's lines to that file, which would list it twice). Any other conflict goes to the fix
-agent (`FIX_AGENT=`, or `--fix-agent`; default the plan's agent) with `merge-prompt.md`, which
-spends one of the `FIXES`; it counts only when the merge is committed with no conflict marker
-left, and is undone otherwise. If the base branch moves while the agent works, the resolution is
-kept and the newer base is merged in after, instead of undoing it. A conflict found while
-landing lets go of the lock first, so no
-other landing waits on the agent, and the gate runs again before the branch lands. `dangle land`
-by hand settles the added-lines kind too and leaves any other conflict for you.
+agent (`FIX_AGENT=`, or `--fix-agent`; default the plan's agent) with `merge-prompt.md`, out of
+its own budget, `MERGE_FIXES=` (default `FIXES`): a merge that takes an hour cannot spend the
+gate's fix-ups, or the other way round. A resolution counts only when the merge is committed
+with no conflict marker left, and is undone otherwise, saying why.
+
+A conflict on a file with no text in it (a recorded screenshot baseline, an image, an archive)
+goes to no agent: it is handed back with the files named, because the fix is to take one side
+and record the file again, not to read it. When a merge does go to the agent, the files it
+cannot read are named in the prompt too, with that instruction.
+
+If the base branch lands while the agent works, the resolution is kept and the newer base is
+taken in before the landing goes on (`MERGE_ROUNDS=` rounds at most): one landing, one
+resolution, instead of the base moving again right after the merge. A conflict found while
+landing lets go of the lock first, so no other landing waits on the agent, and the gate runs
+again before the branch lands. `dangle land` by hand settles the added-lines kind too and leaves
+any other conflict for you. Every landing keeps its own log, `.git/dangle/logs/<id>.landing.log`:
+the base it merged, and why it stopped.
 
 ### One plan at a time, more runners when you want them
 
@@ -202,7 +212,8 @@ means the plan or the work; NOT RUN means the provider or the agent's setup.
 The night also stops when the agent fails fast twice in a row, and says why the last one
 failed, instead of failing every plan in minutes. The computer is kept awake
 (`systemd-inhibit` or `caffeinate`). The summary is in `.git/dangle/last-run.md`, and the
-logs are in `.git/dangle/logs/`.
+logs are in `.git/dangle/logs/`: `<id>.log` (the agent), `<id>.gate.log` and
+`<id>.landing.log` (what each landing merged, and why it stopped).
 
 ## Plans that are already done
 
@@ -277,7 +288,7 @@ node_modules into new worktrees" or "land through a GitHub PR and wait for CI".
 | `audit-prompt.md` | `dangle audit` | the audit prompt, with `{{plan}}` |
 | `hooks/lint <plans>` | `dangle lint` | your own plan checks (skill names exist, no forbidden commands); exit non-zero = error |
 | `hooks/done <summary>` | end of a run | notify yourself: `notify-send`, ntfy, e-mail |
-| `prompt.md`, `fix-prompt.md`, `merge-prompt.md` | each agent run | the prompts, with `{{plan}}`, `{{branch}}`, `{{base}}`, `{{gate}}`, `{{gate_log}}`, `{{gate_tail}}`, `{{conflicts}}` |
+| `prompt.md`, `fix-prompt.md`, `merge-prompt.md` | each agent run | the prompts, with `{{plan}}`, `{{branch}}`, `{{base}}`, `{{gate}}`, `{{gate_log}}`, `{{gate_tail}}`, `{{conflicts}}`, `{{binary_conflicts}}` |
 
 Hooks run with `DANGLE_PRIMARY` (the main checkout), `DANGLE_WORKTREE`, `DANGLE_BRANCH`,
 `DANGLE_BASE`, and for `land`, `DANGLE_TITLE`, `DANGLE_MESSAGE_FILE` and `DANGLE_REMOTE`.
@@ -401,6 +412,8 @@ DONE=done            # landed plans move to PLANS/DONE
 AGENT=claude:sonnet   # default: claude
 FIX_AGENT=claude:opus  # fix-ups after a failed gate or merge conflict (default: AGENT)
 FIXES=1              # fix-up runs after a failed gate
+MERGE_FIXES=1        # fix-up runs to resolve a merge of the base branch (default: FIXES)
+MERGE_ROUNDS=3       # a landing takes a base that moved while resolving in, at most this often
 AGENT_TIMEOUT=4h
 STALL_TIMEOUT=60m    # stop an agent with no new commit for this long; 0 = never
 RETRY_WAIT=5m 15m    # waits before trying a plan again after a provider error; 0 = never

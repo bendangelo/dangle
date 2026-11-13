@@ -57,6 +57,13 @@ if grep -q '^Agent: race' "$plan"; then
   git -C "$DANGLE_PRIMARY" commit -qam race && git -C "$DANGLE_PRIMARY" push -q origin main
   echo plan-edit > README
 fi
+# "Agent: binary" changes a file the base branch changes too, with no text in it to merge.
+if grep -q '^Agent: binary' "$plan"; then
+  printf 'base\000\001\n' > "$DANGLE_PRIMARY/$f"
+  git -C "$DANGLE_PRIMARY" add -A && git -C "$DANGLE_PRIMARY" commit -qm "base image" &&
+    git -C "$DANGLE_PRIMARY" push -q origin main
+  printf 'plan\000\002\n' > "$f"
+fi
 if grep -q '^Agent: twice' "$plan"; then
   printf 'base\nbase-line\nend\nsame-line\n' > "$DANGLE_PRIMARY/README"
   git -C "$DANGLE_PRIMARY" commit -qam race && git -C "$DANGLE_PRIMARY" push -q origin main
@@ -398,7 +405,26 @@ plan 010-race.md a.txt 'Agent: race
 Agent: movebase'
 commit
 "$DANGLE" -y > "$tmp/out" 2>&1
-check "a base that moves while the merge agent works keeps the resolution and lands" '[ -f a.txt ] && [ "$(cat README)" = resolved ] && [ -f docs/moved.md ] && grep -q "1 landed" "$tmp/out" && ! grep -q "FAILED" "$tmp/out"'
+check "a base that moves while the merge agent works keeps the resolution and lands" '[ -f a.txt ] && [ "$(cat README)" = resolved ] && [ -f docs/moved.md ] && grep -q "main moved while resolving" "$tmp/out" && grep -q "1 landed" "$tmp/out" && ! grep -q "FAILED" "$tmp/out"'
+
+repo binarymerge
+plan 010-img.md img.png 'Agent: binary'
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
+check "a binary conflict is named and handed to no agent" '[ $rc = 1 ] && grep -q "only binary conflicts (img.png)" "$tmp/out" && ! grep -q "the agent resolves them" "$tmp/out" && ! git -C .worktrees/plan-010 rev-parse -q --verify MERGE_HEAD >/dev/null'
+
+repo mergebudget
+printf 'BASE=main\nPLANS=plans\nAGENT=%s\nFIXES=0\nMERGE_FIXES=1\n' "$tmp/agent" > .dangle/config
+plan 010-race.md a.txt 'Agent: race'
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "a merge keeps its own fix-up budget (MERGE_FIXES): it is resolved when FIXES is spent" '[ "$(cat README)" = resolved ] && grep -q "the agent resolves them" "$tmp/out" && grep -q "1 landed" "$tmp/out"'
+
+repo landlog
+plan 010-race.md a.txt 'Agent: race-bad'
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1
+check "why a landing stopped is kept in its land log" 'grep -q "failed: conflicts with main (the resolution has a leftover conflict marker)" .git/dangle/logs/010.landing.log'
 
 # A fix agent that cannot start (a bad flag): the failure says so, not just "conflicts".
 printf '#!/bin/sh\necho "Error: Unknown option: --bogus"\nexit 1\n' > "$tmp/badfix"
