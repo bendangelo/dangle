@@ -845,6 +845,27 @@ check "queue: one gate per batch, then one per half" '[ "$(wc -l < .gate-runs | 
 check "queue: one squashed commit per branch, pushed" '[ "$(git log --format=%s main | grep -c "^add q")" = 2 ] && [ "$(git rev-parse main)" = "$(git rev-parse origin/main)" ]'
 check "queue: the queue worktree stays; landed worktrees go" '[ -d .worktrees/dangle-queue ] && [ ! -d .worktrees/qa ] && [ -d .worktrees/qb ] && [ -z "$(ls .git/dangle/queue)" ]'
 
+# A git command stopped half-way in the queue worktree leaves index.lock; one deleted by hand
+# leaves a registration without a folder. Neither hands the next branch back.
+queue_repo queueheal '#!/bin/sh
+exit 0'
+branch_with ha ha.txt
+"$DANGLE" land ha > "$tmp/out" 2>&1
+lock=$(git -C .worktrees/dangle-queue rev-parse --path-format=absolute --git-path index.lock)
+: > "$lock"
+branch_with hb hb.txt
+DANGLE_INDEX_LOCK_GRACE=0 "$DANGLE" land hb > "$tmp/out" 2>&1; export rc=$?
+check "queue: a stale index.lock in the queue worktree is removed and the branch lands" '[ $rc = 0 ] && [ -f hb.txt ] && [ ! -e "$lock" ] && grep -q "left by a git command that was stopped" "$tmp/out"'
+: > "$lock"
+branch_with hc hc.txt
+"$DANGLE" land hc > "$tmp/out" 2>&1; export rc=$?
+check "queue: a fresh index.lock is left alone" '[ $rc != 0 ] && [ -e "$lock" ] && [ ! -f hc.txt ]'
+rm -f "$lock"
+rm -rf .worktrees/dangle-queue
+branch_with hd hd.txt
+"$DANGLE" land hd > "$tmp/out" 2>&1; export rc=$?
+check "queue: a deleted queue worktree is made again" '[ $rc = 0 ] && [ -f hd.txt ] && [ -e .worktrees/dangle-queue/.git ]'
+
 queue_repo queueconflict "$counting_gate"
 branch_with qa qa.txt; branch_with qx README x; branch_with qy README y
 "$DANGLE" land qa > "$tmp/outa" 2>&1 & ra=$!

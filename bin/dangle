@@ -455,6 +455,37 @@ take_lock() {
 }
 drop_lock() { [ "$(cat "$1/pid" 2>/dev/null)" = $$ ] && rm -rf "$1"; return 0; }
 
+# git_busy_in <dir>: 0 when a git process runs with its working directory in <dir> (`git -C`
+# changes it). The base checkout does not count a git in one of the worktrees under it.
+git_busy_in() {
+  local dir pid cwd
+  dir=$(cd "$1" 2>/dev/null && pwd -P) || return 1
+  for pid in $(pgrep -x git 2>/dev/null); do
+    if [ -d /proc ]; then cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+    else cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'); fi
+    [ -n "$cwd" ] || continue
+    case "$cwd/" in "$PRIMARY/$WORKTREES"/*) [ "$dir" = "$PRIMARY" ] && continue ;; esac
+    case "$cwd/" in "$dir"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+# clear_stale_index_lock <worktree>: a git command stopped half-way (Ctrl-C, a timeout, the
+# OOM killer) leaves index.lock behind, and every later git command in that worktree fails
+# with "File exists": the queue would hand every branch back. A lock older than
+# DANGLE_INDEX_LOCK_GRACE seconds (60) with no git running in the worktree is removed. A git
+# still at work (a commit with its editor open holds the lock too) keeps it.
+clear_stale_index_lock() {
+  local lock age
+  lock=$(git -C "$1" rev-parse --path-format=absolute --git-path index.lock 2>/dev/null) || return 0
+  [ -f "$lock" ] || return 0
+  age=$(( $(date +%s) - $(file_epoch "$lock") ))
+  [ "$age" -ge "${DANGLE_INDEX_LOCK_GRACE:-60}" ] || return 0
+  git_busy_in "$1" && return 0
+  rm -f "$lock" && say "  note   removed $lock: ${age}s old, left by a git command that was stopped"
+  return 0
+}
+
 # claim <id>: 0 when this process now owns the plan, 1 when another live dangle runs it.
 claim() {
   local dir="$STATE/claims/$1" pid
@@ -583,6 +614,7 @@ advance_base() {
   local bw head
   bw=$(base_checkout)
   if [ -n "$bw" ]; then
+    clear_stale_index_lock "$bw"
     git -C "$bw" merge -q --ff-only "$1" 2>/dev/null && return 0
     head=$(git -C "$bw" rev-parse HEAD)
     git merge-base --is-ancestor "$2" "$head" ||
@@ -623,6 +655,7 @@ sync_base() {
   else
     bw=$(base_checkout)
     [ -n "$bw" ] || die "$BASE and $REMOTE/$BASE have diverged; rebase $BASE first"
+    clear_stale_index_lock "$bw"
     git -C "$bw" rebase -q "$REMOTE/$BASE" >/dev/null 2>&1 || {
       git -C "$bw" rebase --abort 2>/dev/null
       die "$BASE and $REMOTE/$BASE have diverged and do not rebase cleanly; fix $BASE by hand"
@@ -745,6 +778,9 @@ new_worktree() {
   ensure_excluded
   forget_pruned "$path" "$branch"
   mkdir -p "$(dirname "$path")"
+  # A worktree whose folder was deleted stays registered, and git refuses to add the branch
+  # again ("missing but already registered worktree"): drop such registrations first.
+  git worktree prune 2>/dev/null
   if git show-ref -q --verify "refs/heads/$branch"; then
     git worktree add -q "$path" "$branch" || return 1
   else
@@ -1649,6 +1685,7 @@ MERGE_WHY=
 merge_base_in() {
   local dir="$1" agent="${3-}" log="${4-}" before rounds=0 binary
   MERGED_BY='' MERGE_WHY='' RERECORD=''
+  clear_stale_index_lock "$dir"
   before=$(git -C "$dir" rev-parse HEAD)
   while :; do
     rounds=$((rounds + 1))
@@ -1790,6 +1827,12 @@ queue_cycle() {
     if [ -f "$e/nogate" ]; then nogate="$nogate $e"; else gated="$gated $e"; fi
   done
   QW=$(wt_path "$QUEUE_BRANCH")
+  # The queue worktree is dangle's own: a folder left without its .git (deleted by hand, a
+  # cleanup cut short) is made again rather than failing every waiting branch.
+  if [ -d "$QW" ] && [ ! -e "$QW/.git" ] && [ ! -f "$QW/.dangle-landed" ]; then
+    say "  queue  $QW lost its .git; making it again"
+    rm -rf -- "$QW"
+  fi
   if [ ! -d "$QW" ]; then
     say "  queue  creating the queue worktree $QW"
     if ! new_worktree "$QUEUE_BRANCH" "$BASE"; then
@@ -1821,6 +1864,7 @@ queue_names() { local e; for e; do printf ' %s' "$(cat "$e/branch")"; done; }
 queue_build() {
   local e b
   QBUILT=
+  clear_stale_index_lock "$QW"
   git -C "$QW" merge --abort 2>/dev/null
   git -C "$QW" reset -q --hard "refs/heads/$BASE" && git -C "$QW" clean -fdq || return 1
   QBASE=$(git rev-parse "refs/heads/$BASE")
