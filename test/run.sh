@@ -413,6 +413,34 @@ commit
 "$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
 check "a binary conflict is named and handed to no agent" '[ $rc = 1 ] && grep -q "only binary conflicts (img.png)" "$tmp/out" && ! grep -q "the agent resolves them" "$tmp/out" && ! git -C .worktrees/plan-010 rev-parse -q --verify MERGE_HEAD >/dev/null'
 
+# rerecord_hook [exit code]: a .dangle/hooks/rerecord that records every file named on stdin again.
+rerecord_hook() {
+  printf '#!/bin/sh\nwhile IFS= read -r f; do printf "recorded\\000\\n" > "$f"; done\nexit %s\n' "${1:-0}" > .dangle/hooks/rerecord
+  chmod +x .dangle/hooks/rerecord
+}
+
+repo rerecord
+rerecord_hook
+plan 010-img.md img.png 'Agent: binary'
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
+check "a binary conflict takes the base's side and hooks/rerecord records it again" '[ $rc = 0 ] && grep -q "1 landed" "$tmp/out" && printf "recorded\000\n" | cmp -s - img.png && ! grep -q "the agent resolves them" "$tmp/out" && grep -q "took main.s side of 1 binary file" "$tmp/out"'
+
+repo rerecordfail
+rerecord_hook 3
+plan 010-img.md img.png 'Agent: binary'
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
+check "a rerecord hook that fails stops the landing and undoes the merge" '[ $rc = 1 ] && grep -q "rerecord exited 3" "$tmp/out" && ! git -C .worktrees/plan-010 rev-parse -q --verify MERGE_HEAD >/dev/null && printf "plan\000\002\n" | cmp -s - .worktrees/plan-010/img.png'
+
+repo rerecordmixed
+rerecord_hook
+plan 010-img.md img.png 'Agent: binary
+Agent: race'
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
+check "text conflicts go to the agent while the binary ones are recorded again" '[ $rc = 0 ] && [ "$(cat README)" = resolved ] && printf "recorded\000\n" | cmp -s - img.png && grep -q "the agent resolves them" "$tmp/out"'
+
 repo mergebudget
 printf 'BASE=main\nPLANS=plans\nAGENT=%s\nFIXES=0\nMERGE_FIXES=1\n' "$tmp/agent" > .dangle/config
 plan 010-race.md a.txt 'Agent: race'

@@ -9,7 +9,7 @@
 set -u
 LC_ALL=C
 export LC_ALL
-VERSION=0.1.33
+VERSION=0.1.34
 
 # The shell's directory when dangle started. remove_worktree must not delete it: a child cannot
 # move its parent shell, so a deleted cwd makes the next prompt warn (mise, for one).
@@ -1523,6 +1523,65 @@ conflicted_text() {
   done
 }
 
+# take_base_binaries <worktree>: with a .dangle/hooks/rerecord, every conflicted file with no text
+# in it takes the base's side (or goes, where the base deleted it), and is added to RERECORD for
+# the hook to record again once the merge is done. Without the hook they are left for
+# merge_base_in to report. Always succeeds.
+RERECORD=
+take_base_binaries() {
+  local dir="$1" files f
+  has_hook rerecord || return 0
+  files=$(conflicted_binary "$dir")
+  [ -n "$files" ] || return 0
+  while IFS= read -r f; do
+    if git -C "$dir" cat-file -e ":3:$f" 2>/dev/null; then
+      git -C "$dir" checkout -q --theirs -- "$f" && git -C "$dir" add -- "$f"
+    else
+      git -C "$dir" rm -q -- "$f"
+    fi
+  done <<FILES
+$files
+FILES
+  RERECORD=$(printf '%s\n%s\n' "$RERECORD" "$files" | sed '/^$/d' | sort -u)
+  say "  merge  took $BASE's side of $(printf '%s\n' "$files" | wc -l | tr -d ' ') binary file(s); .dangle/hooks/rerecord records them again"
+  return 0
+}
+
+# commit_if_merged <worktree>: finishes the merge in progress when no conflict is left.
+commit_if_merged() {
+  [ -z "$(git -C "$1" diff --name-only --diff-filter=U)" ] &&
+    git -C "$1" rev-parse -q --verify MERGE_HEAD >/dev/null &&
+    git -C "$1" commit -q --no-edit
+}
+
+# rerecord_merged <worktree>: after a merge that took the base's side of the files RERECORD
+# names, runs .dangle/hooks/rerecord in the worktree with those files on stdin, one per line, and
+# commits what it wrote. The gate then checks the result like any other change. MERGE_WHY says
+# why, when it fails.
+rerecord_merged() {
+  local dir="$1" log list rc=0
+  [ -n "$RERECORD" ] || return 0
+  list="$STATE/rerecord.$$"
+  log=${LAND_LOG:+${LAND_LOG%.landing.log}.rerecord.log}
+  log=${log:-$STATE/rerecord.$$.log}
+  printf '%s\n' "$RERECORD" > "$list"
+  printf '=== rerecord %s ===\n' "$(date)" >> "$log"
+  say "  merge  .dangle/hooks/rerecord (log $log)"
+  run_limited "$GATE_SECS" sh -c 'cd "$1" && DANGLE_HOOK=rerecord exec "$2" < "$3"' sh \
+    "$dir" "$HOOKS/rerecord" "$list" >> "$log" 2>&1 || rc=$?
+  rm -f "$list"
+  if [ $rc != 0 ]; then
+    MERGE_WHY="the binary files were taken from $BASE, but .dangle/hooks/rerecord exited $rc (log $log): $(tail -n 3 "$log" | tr '\n' ' ')"
+    return 1
+  fi
+  if [ -n "$(git -C "$dir" status --porcelain)" ]; then
+    git -C "$dir" add -A && git -C "$dir" commit -q -m "Record again after merging $BASE" ||
+      { MERGE_WHY="what .dangle/hooks/rerecord wrote could not be committed"; return 1; }
+  fi
+  land_note "recorded again: $(printf '%s' "$RERECORD" | tr '\n' ' ')"
+  RERECORD=
+}
+
 # merge_by_agent <worktree> <agent spec> <log> <commit before the merge>: the agent resolves the
 # merge in progress. It counts only when the merge is committed with no conflict marker left.
 # MERGE_WHY says why it was not accepted, on every path that refuses it.
@@ -1569,16 +1628,19 @@ MERGED_BY=
 MERGE_WHY=
 merge_base_in() {
   local dir="$1" agent="${3-}" log="${4-}" before rounds=0 binary
-  MERGED_BY='' MERGE_WHY=''
+  MERGED_BY='' MERGE_WHY='' RERECORD=''
   before=$(git -C "$dir" rev-parse HEAD)
   while :; do
     rounds=$((rounds + 1))
     if git -C "$dir" merge -q --no-edit "refs/heads/$BASE" >/dev/null 2>&1; then
       :
+    elif take_base_binaries "$dir" && commit_if_merged "$dir"; then
+      [ "$MERGED_BY" = agent ] || MERGED_BY=auto
     elif settle_added "$dir"; then
       [ "$MERGED_BY" = agent ] || MERGED_BY=auto
     elif [ "${2-}" = 1 ]; then
       err "the merge of $BASE into $1 conflicts: resolve it there, commit, and run dangle land again"
+      [ -z "$RERECORD" ] || err "binary files were taken from $BASE: run .dangle/hooks/rerecord there after the merge"
       MERGE_WHY="the merge of $BASE is left in progress"
       land_note "merge in progress: $(git -C "$dir" diff --name-only --diff-filter=U | tr '\n' ' ')"
       return 1
@@ -1587,7 +1649,7 @@ merge_base_in() {
       if [ -z "$agent" ]; then
         MERGE_WHY="no agent for a merge (land --fix, or FIX_AGENT in .dangle/config)"
       elif [ -n "$binary" ] && [ -z "$(conflicted_text "$dir")" ]; then
-        MERGE_WHY="only binary conflicts ($(printf '%s' "$binary" | tr '\n' ' ')): take one side and record them again, no agent can merge them"
+        MERGE_WHY="only binary conflicts ($(printf '%s' "$binary" | tr '\n' ' ')): take one side and record them again (or add .dangle/hooks/rerecord), no agent can merge them"
       elif merge_by_agent "$dir" "$agent" "$log" "$before"; then
         MERGED_BY=agent
       else
@@ -1596,8 +1658,10 @@ merge_base_in() {
       [ "$MERGED_BY" = agent ] || break
     fi
     # Take the base as it is now, not as it was when the merge started.
-    git -C "$dir" merge-base --is-ancestor "refs/heads/$BASE" "$(git -C "$dir" rev-parse HEAD)" &&
-      return 0
+    if git -C "$dir" merge-base --is-ancestor "refs/heads/$BASE" "$(git -C "$dir" rev-parse HEAD)"; then
+      rerecord_merged "$dir" && return 0
+      break
+    fi
     if [ $rounds -ge "$MERGE_ROUNDS" ]; then
       MERGE_WHY="$BASE moved $rounds times while resolving: try again"
       break
@@ -2536,7 +2600,7 @@ cmd_doctor() {
   [ -f "$DOT/config" ] && ok ".dangle/config" || warn "no .dangle/config: run dangle init"
   if has_hook gate; then ok "gate hook"; else no "no executable .dangle/hooks/gate: nothing would check the work"; fi
   if has_hook prune; then ok "prune hook"; else warn "no .dangle/hooks/prune: build caches are never reclaimed (worktrees are still retired)"; fi
-  for w in setup teardown prune regate land lint "done"; do
+  for w in setup teardown prune regate rerecord land lint "done"; do
     if [ -e "$HOOKS/$w" ] && [ ! -x "$HOOKS/$w" ]; then no ".dangle/hooks/$w is not executable (chmod +x)"; fi
   done
   if [ -n "$(cfg AGENT)" ]; then

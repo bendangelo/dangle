@@ -152,9 +152,14 @@ gate's fix-ups, or the other way round. A resolution counts only when the merge 
 with no conflict marker left, and is undone otherwise, saying why.
 
 A conflict on a file with no text in it (a recorded screenshot baseline, an image, an archive)
-goes to no agent: it is handed back with the files named, because the fix is to take one side
-and record the file again, not to read it. When a merge does go to the agent, the files it
-cannot read are named in the prompt too, with that instruction.
+goes to no agent, because the fix is to take one side and record the file again, not to read it.
+With a `.dangle/hooks/rerecord`, dangle does that itself: it takes the base's side of each such
+file, finishes the merge (any text conflicts go to the agent as usual), runs the hook in the
+worktree with the files on stdin, one per line, and commits what it wrote; the gate then checks
+the result. The hook's output is in `.git/dangle/logs/<id>.rerecord.log`, and a hook that fails
+undoes the merge, saying so. Without the hook the landing is handed back with the files named.
+When a merge does go to the agent, the files it cannot read are named in the prompt too, with
+that instruction.
 
 If the base branch lands while the agent works, the resolution is kept and the newer base is
 taken in before the landing goes on (`MERGE_ROUNDS=` rounds at most): one landing, one
@@ -281,6 +286,7 @@ node_modules into new worktrees" or "land through a GitHub PR and wait for CI".
 | `copy` | new worktree | paths copied from the main checkout (copy-on-write where the disk can), or `link <path>` for a symlink: `.env`, `node_modules`, a warm `target/` |
 | `hooks/setup` | new worktree, after `copy` | install dependencies, reserve a port, seed a database |
 | `hooks/gate` | before every landing | your checks; exit 0 = may land |
+| `hooks/rerecord` | a merge of the base where files with no text in them conflict | record those files (on stdin) again after the base's side is taken: screenshot baselines, generated images |
 | `hooks/regate <old> <new>` | the base moved during a gate | exit 1 = no second gate (e.g. only docs changed) |
 | `hooks/land` | landing, after the gate | replaces the built-in squash-and-push |
 | `hooks/teardown` | before a worktree is removed | save a build cache for the next one |
