@@ -151,8 +151,9 @@ its own budget, `MERGE_FIXES=` (default `FIXES`): a merge that takes an hour can
 gate's fix-ups, or the other way round. A resolution counts only when the merge is committed
 with no conflict marker left, and is undone otherwise, saying why.
 
-A conflict on a file with no text in it (a recorded screenshot baseline, an image, an archive)
-goes to no agent, because the fix is to take one side and record the file again, not to read it.
+A conflict on a file with no text in it (a recorded screenshot baseline, an image, an archive),
+or on a text file `.gitattributes` marks `dangle-rerecord` (a list of baseline hashes, where
+neither side's line is the merged tree's: `apps/snapshots.toml dangle-rerecord`), goes to no agent, because the fix is to take one side and record the file again, not to read it.
 With a `.dangle/hooks/rerecord`, dangle does that itself: it takes the base's side of each such
 file, finishes the merge (any text conflicts go to the agent as usual), runs the hook in the
 worktree with the files on stdin, one per line, and commits what it wrote; the gate then checks
@@ -421,9 +422,10 @@ FIXES=1              # fix-up runs after a failed gate
 MERGE_FIXES=1        # fix-up runs to resolve a merge of the base branch (default: FIXES)
 MERGE_ROUNDS=3       # a landing takes a base that moved while resolving in, at most this often
 AGENT_TIMEOUT=4h
-STALL_TIMEOUT=60m    # stop an agent with no new commit for this long; 0 = never
+STALL_TIMEOUT=60m    # stop an agent with no new commit or edit for this long; 0 = never
 RETRY_WAIT=5m 15m    # waits before trying a plan again after a provider error; 0 = never
 GATE_TIMEOUT=60m
+GATE_TAIL=80         # lines of the gate log in a fix-up prompt ({{gate_tail}})
 REMOTE=origin        # none: never fetch or push
 WORKTREES=.worktrees
 BRANCH_PREFIX=plan-

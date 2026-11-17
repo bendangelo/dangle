@@ -47,6 +47,10 @@ esac
 grep -q '^Agent: idle' "$plan" && exit 0
 # "Agent: stall" works without ever committing (the stall watch stops it).
 grep -q '^Agent: stall' "$plan" && { sleep 60; exit 0; }
+# "Agent: busy" edits a file every second for longer than STALL_TIMEOUT, committing nothing.
+if grep -q '^Agent: busy' "$plan"; then
+  for i in 1 2 3 4 5 6; do echo "$i" > busy.txt; sleep 1; done
+fi
 f=$(sed -n 's/^Create: //p' "$plan")
 echo "made by $DANGLE_PLAN with ${DANGLE_MODEL:-?}" > "$f"
 grep -q '^Agent: broken' "$plan" && touch BAD
@@ -63,6 +67,13 @@ if grep -q '^Agent: binary' "$plan"; then
   git -C "$DANGLE_PRIMARY" add -A && git -C "$DANGLE_PRIMARY" commit -qm "base image" &&
     git -C "$DANGLE_PRIMARY" push -q origin main
   printf 'plan\000\002\n' > "$f"
+fi
+# "Agent: hashes" is "Agent: binary" with text in the file: a list the project records again.
+if grep -q '^Agent: hashes' "$plan"; then
+  printf 'screen = "base"\n' > "$DANGLE_PRIMARY/$f"
+  git -C "$DANGLE_PRIMARY" add -A && git -C "$DANGLE_PRIMARY" commit -qm "base hashes" &&
+    git -C "$DANGLE_PRIMARY" push -q origin main
+  printf 'screen = "plan"\n' > "$f"
 fi
 if grep -q '^Agent: twice' "$plan"; then
   printf 'base\nbase-line\nend\nsame-line\n' > "$DANGLE_PRIMARY/README"
@@ -147,7 +158,14 @@ commit
 t0=$(date +%s)
 "$DANGLE" -y > "$tmp/out" 2>&1
 export took=$(( $(date +%s) - t0 ))
-check "an agent with no new commit for STALL_TIMEOUT is stopped" '[ $took -lt 30 ] && grep -q "stopped: no new commit in 2s" "$tmp/out" && grep -q "no new commit in 2s" .git/dangle/logs/010.log'
+check "an agent with no new commit for STALL_TIMEOUT is stopped" '[ $took -lt 30 ] && grep -q "stopped: no new commit or edit in 2s" "$tmp/out" && grep -q "no new commit or edit in 2s" .git/dangle/logs/010.log'
+
+repo busy
+printf 'STALL_TIMEOUT=2s\n' >> .dangle/config
+plan 010-busy.md a.txt 'Agent: busy'
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
+check "an agent that keeps editing without committing is not stopped as stalled" '[ $rc = 0 ] && grep -q "1 landed" "$tmp/out" && ! grep -q "stopped: no new commit" "$tmp/out"'
 
 repo deps
 plan 010-bad.md a.txt 'Agent: idle'
@@ -440,6 +458,14 @@ Agent: race'
 commit
 "$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
 check "text conflicts go to the agent while the binary ones are recorded again" '[ $rc = 0 ] && [ "$(cat README)" = resolved ] && printf "recorded\000\n" | cmp -s - img.png && grep -q "the agent resolves them" "$tmp/out"'
+
+repo rerecordattr
+rerecord_hook
+printf '*.toml dangle-rerecord\n' > .gitattributes
+plan 010-hashes.md hashes.toml 'Agent: hashes'
+commit
+"$DANGLE" -y > "$tmp/out" 2>&1; export rc=$?
+check "a text file marked dangle-rerecord is recorded again, not handed to an agent" '[ $rc = 0 ] && grep -q "1 landed" "$tmp/out" && printf "recorded\000\n" | cmp -s - hashes.toml && ! grep -q "the agent resolves them" "$tmp/out"'
 
 repo mergebudget
 printf 'BASE=main\nPLANS=plans\nAGENT=%s\nFIXES=0\nMERGE_FIXES=1\n' "$tmp/agent" > .dangle/config

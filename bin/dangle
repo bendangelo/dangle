@@ -9,7 +9,7 @@
 set -u
 LC_ALL=C
 export LC_ALL
-VERSION=0.1.34
+VERSION=0.1.35
 
 # The shell's directory when dangle started. remove_worktree must not delete it: a child cannot
 # move its parent shell, so a deleted cwd makes the next prompt warn (mise, for one).
@@ -372,9 +372,20 @@ heartbeat() {
 }
 stop_heartbeat() { [ -n "$HB" ] && kill "$HB" 2>/dev/null; HB=; return 0; }
 
-# stall_watch <worktree> <log>: stops the agent when its worktree has had no new commit for
-# STALL_TIMEOUT (0 = off): an agent stuck on one failure can loop until AGENT_TIMEOUT. It leaves
-# <log>.stalled for run_agent to report. Stopped with stop_stall_watch.
+# work_state <worktree>: a checksum of what an agent has done there: its commits, its edits to
+# tracked files and its new files (ignored ones aside). An agent editing, or with a long check
+# writing its log, is at work; one going round the same failure changing nothing is not.
+work_state() {
+  {
+    git -C "$1" rev-parse -q --verify HEAD
+    git -C "$1" diff HEAD
+    (cd "$1" && git ls-files -z -o --exclude-standard | xargs -0 cksum)
+  } 2>/dev/null < /dev/null | cksum
+}
+
+# stall_watch <worktree> <log>: stops the agent when its worktree has had no new commit and no
+# edit for STALL_TIMEOUT (0 = off): an agent stuck on one failure can loop until AGENT_TIMEOUT.
+# It leaves <log>.stalled for run_agent to report. Stopped with stop_stall_watch.
 STALL=
 stall_watch() {
   [ "$STALL_SECS" -gt 0 ] || return 0
@@ -383,11 +394,11 @@ stall_watch() {
     s=''
     trap '[ -n "$s" ] && kill "$s" 2>/dev/null; exit 0' TERM
     step=60; [ "$STALL_SECS" -lt $step ] && step=$STALL_SECS
-    head=$(git -C "$dir" rev-parse -q --verify HEAD 2>/dev/null); since=$(date +%s)
+    head=$(work_state "$dir"); since=$(date +%s)
     while :; do
       sleep "$step" & s=$!
       wait "$s" || exit 0
-      now=$(git -C "$dir" rev-parse -q --verify HEAD 2>/dev/null)
+      now=$(work_state "$dir")
       if [ "$now" != "$head" ]; then head=$now; since=$(date +%s); continue; fi
       [ $(( $(date +%s) - since )) -ge "$STALL_SECS" ] || continue
       pid=$(cat "$STATE/child.$$" 2>/dev/null) || continue
@@ -1341,8 +1352,8 @@ run_agent() {
   [ -n "$tailer" ] && kill "$tailer" 2>/dev/null
   if [ -f "$log.stalled" ]; then
     rm -f "$log.stalled"
-    say "  agent  stopped: no new commit in $(cfg STALL_TIMEOUT 60m)"
-    printf 'dangle: stopped, no new commit in %s\n' "$(cfg STALL_TIMEOUT 60m)" >> "$log"
+    say "  agent  stopped: no new commit or edit in $(cfg STALL_TIMEOUT 60m)"
+    printf 'dangle: stopped, no new commit or edit in %s\n' "$(cfg STALL_TIMEOUT 60m)" >> "$log"
   elif [ $rc = 124 ]; then
     say "  agent  stopped after $(cfg AGENT_TIMEOUT 4h)"
   fi
@@ -1503,14 +1514,23 @@ is_binary() {
   git -C "$1" cat-file blob "$2" 2>/dev/null | head -c 8192 | od -An -tx1 | tr ' ' '\n' | grep -qx 00
 }
 
+# recorded <worktree> <path>: a conflicted file settled by recording it again, not by reading it:
+# no text in it, or one the project's .gitattributes marks `dangle-rerecord` (a list of baseline
+# hashes, say: text, but neither side's line is the merged tree's).
+recorded() {
+  case $(git -C "$1" check-attr dangle-rerecord -- "$2" 2>/dev/null) in *': set') return 0 ;; esac
+  is_binary "$1" ":2:$2"
+}
+
 # conflicted_binary <worktree>: the conflicted files with no text to merge (a recorded baseline,
-# an image, an archive). No one settles one of those by reading it: one side is taken and the
-# project records the file again. An agent reading a PNG spends an hour learning that.
+# an image, an archive) or marked `dangle-rerecord`. No one settles one of those by reading it:
+# one side is taken and the project records the file again. An agent reading a PNG spends an
+# hour learning that.
 conflicted_binary() {
   local dir="$1" f
   git -C "$dir" diff --name-only --diff-filter=U | while IFS= read -r f; do
     [ -n "$f" ] || continue
-    if is_binary "$dir" ":2:$f"; then printf '%s\n' "$f"; fi
+    if recorded "$dir" "$f"; then printf '%s\n' "$f"; fi
   done
 }
 
@@ -1519,7 +1539,7 @@ conflicted_text() {
   local dir="$1" f
   git -C "$dir" diff --name-only --diff-filter=U | while IFS= read -r f; do
     [ -n "$f" ] || continue
-    if ! is_binary "$dir" ":2:$f"; then printf '%s\n' "$f"; fi
+    if ! recorded "$dir" "$f"; then printf '%s\n' "$f"; fi
   done
 }
 
@@ -1963,7 +1983,7 @@ queue_land() {
         fi
         fixes=$((fixes + 1))
         say "  gate   failed; fix-up $fixes of $FIXES"
-        DANGLE_T_gate_log=$log DANGLE_T_gate_tail=$(tail -n 80 "$log")
+        DANGLE_T_gate_log=$log DANGLE_T_gate_tail=$(tail -n "$(cfg GATE_TAIL 80)" "$log")
         export DANGLE_T_gate_log DANGLE_T_gate_tail
         fix_up "$fix" "$path" "$alog" || return 1
         synced
@@ -2034,7 +2054,7 @@ land() {
     fi
     fixes=$((fixes + 1))
     say "  gate   failed; fix-up $fixes of $FIXES"
-    DANGLE_T_gate_log=$log DANGLE_T_gate_tail=$(tail -n 80 "$log")
+    DANGLE_T_gate_log=$log DANGLE_T_gate_tail=$(tail -n "$(cfg GATE_TAIL 80)" "$log")
     export DANGLE_T_gate_log DANGLE_T_gate_tail
     fix_up "$fix" "$path" "$alog" || return 1
     synced
@@ -2761,7 +2781,7 @@ DONE=done
 # Fix-up runs after a failed gate or merge conflict (0 = none).
 FIXES=1
 AGENT_TIMEOUT=4h
-# An agent with no new commit for this long is stopped (0 = never).
+# An agent with no new commit or edit for this long is stopped (0 = never).
 STALL_TIMEOUT=60m
 GATE_TIMEOUT=60m
 # Short names for -a:  dangle -a cheap
